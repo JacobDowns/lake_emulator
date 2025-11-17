@@ -1,0 +1,91 @@
+# --- Python basics ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# --- Virtual environments / Conda ---
+.env
+.venv
+env/
+venv/
+conda-env/
+*.conda
+*.env.yml.backup
+
+# --- Jupyter & notebooks ---
+.ipynb_checkpoints/
+*.nbconvert.ipynb
+jupyter_notebook_config.py
+
+# --- Logs, cache, temp ---
+*.log
+*.tmp
+*.bak
+*.swp
+.DS_Store
+Thumbs.db
+.cache/
+logs/
+tmp/
+outputs/
+wandb/
+lightning_logs/
+
+# --- Data / artifacts ---
+# raw or generated data
+data/raw/
+data/interim/
+data/processed/
+data/parsed_data/
+!data/README.md  # keep data readme if you add one
+
+# MLflow runs and artifacts
+mlruns/
+artifacts*/
+artifacts_*/
+
+# --- Models / checkpoints ---
+*.pt
+*.pth
+*.ckpt
+*.npz
+*.npy
+checkpoints/
+models/
+runs/
+
+# --- Figures / reports ---
+figures/
+plots/
+reports/
+*.png
+*.pdf
+*.svg
+
+# --- Environment / IDE files ---
+.envrc
+.env.local
+.vscode/
+.idea/
+.spyproject/
+__workspace__.json
+
+# --- Testing / coverage ---
+.coverage
+htmlcov/
+.tox/
+pytest_cache/
+.mypy_cache/
+.pytest_cache/
+
+# --- Hydra / Optuna (if you use them) ---
+outputs/**
+multirun/**
+.optuna/
