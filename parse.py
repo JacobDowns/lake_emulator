@@ -1,11 +1,11 @@
 import pandas as pd
 import numpy as np
-import os
+import os, json
 
 # ----------------------
 # Paths
 # ----------------------
-WEATHER_CSV = 'data/parsed_data/weather_data.csv'  # your saved CSV
+WEATHER_CSV = 'data/parsed_data/weather_data.csv'  # must contain YEAR and DOY (or DAY=DOY)
 PARAMS_CSV  = 'data/BearLake_inputs_outputs/inputs/parameter-values-tested.csv'
 OUTPUTS_DIR = 'data/BearLake_inputs_outputs/outputs'
 OUT_DIR     = 'data/parsed_data'
@@ -13,91 +13,100 @@ OUT_DIR     = 'data/parsed_data'
 os.makedirs(OUT_DIR, exist_ok=True)
 
 # ----------------------
-# Load weather (expects YEAR, MON, and DAY as DOY, or DOY column)
+# Load weather and normalize date cols
 # ----------------------
 weather = pd.read_csv(WEATHER_CSV)
 
-# If a DOY column exists, use it; else assume DAY already means DOY
-if 'DOY' in weather.columns:
-    weather['DOY'] = weather['DOY'].astype(int)
-    doy_col = 'DOY'
-else:
-    weather['DAY'] = weather['DAY'].astype(int)
-    doy_col = 'DAY'
-
+# If DOY exists, use it; else assume DAY already means DOY
+doy_col = 'DOY' if 'DOY' in weather.columns else 'DAY'
 weather['YEAR'] = weather['YEAR'].astype(int)
+weather[doy_col] = weather[doy_col].astype(int)
 
-# Keep a clean key for join
-weather_key = weather[['YEAR', doy_col]].copy().rename(columns={doy_col: 'DOY'})
+# Weather key for overlap
+weather_key = weather[['YEAR', doy_col]].rename(columns={doy_col: 'DOY'})
 weather_key = weather_key.drop_duplicates().sort_values(['YEAR','DOY']).reset_index(drop=True)
 
 # ----------------------
-# Determine overlap of (YEAR, DOY) across ALL outputs and weather
+# Parameters
 # ----------------------
-# Start with weather's set
-overlap = set(map(tuple, weather_key[['YEAR','DOY']].to_numpy()))
-
-# If you only want intersection with outputs that correspond to the parameter rows below,
-# we’ll compute N from the params and loop over profile-laketemp-{i}.txt files.
-parameter_data = pd.read_csv(PARAMS_CSV)
-param_mat = parameter_data.iloc[:, 1:].to_numpy(dtype=np.float32)  # drop first column (e.g., trial id)
-N = parameter_data.shape[0]
-print("Parameter matrix shape:", param_mat.shape)
+parameter_df = pd.read_csv(PARAMS_CSV)
+param_mat = parameter_df.iloc[:, 1:].to_numpy(dtype=np.float32)  # drop first (trial id)
+N = param_mat.shape[0]
 np.save(os.path.join(OUT_DIR, 'parameter_data.npy'), param_mat)
+print("parameter_data.npy:", param_mat.shape)
 
-# Intersect with each output's (YEAR, DOY)
-output_keys = []
+# ----------------------
+# Determine overlap (YEAR, DOY) across all outputs
+# ----------------------
+overlap = set(map(tuple, weather_key[['YEAR','DOY']].to_numpy()))
 for i in range(N):
     out_path = os.path.join(OUTPUTS_DIR, f'profile-laketemp-{i}.txt')
     df_out = pd.read_csv(out_path, sep=r'\s+')
-    # Output DAY already means DOY
     df_out['YEAR'] = df_out['YEAR'].astype(int)
-    df_out['DOY']  = df_out['DAY'].astype(int)
+    df_out['DOY']  = df_out['DAY'].astype(int)  # output's DAY is DOY
     k = df_out[['YEAR','DOY']].drop_duplicates()
-    output_keys.append(set(map(tuple, k.to_numpy())))
-    # Progressive intersection
-    overlap = overlap.intersection(output_keys[-1])
+    overlap &= set(map(tuple, k.to_numpy()))
 
-# Convert overlap back to a sorted DataFrame for clean merging
-overlap_df = pd.DataFrame(list(overlap), columns=['YEAR','DOY']).astype({'YEAR': int, 'DOY': int})
+overlap_df = pd.DataFrame(list(overlap), columns=['YEAR','DOY']).astype(int)
 overlap_df = overlap_df.sort_values(['YEAR','DOY']).reset_index(drop=True)
-print(f"Overlapping dates count: {len(overlap_df)}")
+T = len(overlap_df)
+print("Overlap timesteps T =", T)
 
 # ----------------------
-# Filter & save WEATHER matrix (drivers only)
+# Save WEATHER matrix: [YEAR, DOY, drivers...]
 # ----------------------
-# Drivers = everything AFTER the first three original columns (YEAR, MON, DAY/DOY),
-# but we’ll be explicit to avoid surprises:
-driver_cols = [c for c in weather.columns if c not in ['YEAR','MON','DAY','DOY']]
-weather_aligned = weather.merge(overlap_df, left_on=['YEAR', doy_col], right_on=['YEAR','DOY'], how='inner')
-weather_aligned = weather_aligned.sort_values(['YEAR','DOY']).reset_index(drop=True)
+# Explicit driver column list = everything except date cols
+date_cols = {'YEAR','MON','DAY','DOY'}
+driver_cols = [c for c in weather.columns if c not in date_cols]
 
-weather_mat = weather_aligned[driver_cols].to_numpy(dtype=np.float32)
-print("weather_data.npy shape:", weather_mat.shape)
+# Align weather rows to overlap
+w_aligned = weather.merge(overlap_df, left_on=['YEAR', doy_col], right_on=['YEAR','DOY'], how='inner')
+w_aligned = w_aligned.sort_values(['YEAR','DOY']).reset_index(drop=True)
+
+# Compose matrix with YEAR/DOY first, then drivers
+weather_mat = np.column_stack([
+    w_aligned['YEAR'].to_numpy(np.int32),
+    w_aligned['DOY'].to_numpy(np.int32),
+    w_aligned[driver_cols].to_numpy(np.float32)
+])
 np.save(os.path.join(OUT_DIR, 'weather_data.npy'), weather_mat)
+print("weather_data.npy:", weather_mat.shape)
 
-# (Optional) save the aligned date index to verify later
-weather_aligned[['YEAR','DOY']].to_csv(os.path.join(OUT_DIR, 'aligned_dates.tsv'), sep='\t', index=False)
+# Save aligned dates for convenience
+overlap_df.to_csv(os.path.join(OUT_DIR, 'aligned_dates.tsv'), sep='\t', index=False)
+
+# Save metadata about weather columns
+meta = {
+    "columns": ["YEAR", "DOY"] + driver_cols,
+    "n_meta": 2,
+    "n_drivers": len(driver_cols)
+}
+with open(os.path.join(OUT_DIR, 'weather_columns.json'), 'w') as f:
+    json.dump(meta, f, indent=2)
 
 # ----------------------
-# Filter & stack OUTPUT matrices
+# Save OUTPUT tensors (temps only), aligned to overlap
 # ----------------------
 output_arrays = []
+depth_cols_cache = None
+
 for i in range(N):
     out_path = os.path.join(OUTPUTS_DIR, f'profile-laketemp-{i}.txt')
     df_out = pd.read_csv(out_path, sep=r'\s+')
-    df_out['DOY']  = df_out['DAY'].astype(int)
     df_out['YEAR'] = df_out['YEAR'].astype(int)
+    df_out['DOY']  = df_out['DAY'].astype(int)
 
-    # Keep only overlapping dates, same order as overlap_df
-    df_out = df_out.merge(overlap_df, on=['YEAR','DOY'], how='inner').sort_values(['YEAR','DOY']).reset_index(drop=True)
+    df_out = df_out.merge(overlap_df, on=['YEAR','DOY'], how='inner') \
+                   .sort_values(['YEAR','DOY']).reset_index(drop=True)
 
-    exclude_cols = {'YEAR', 'MON', 'DAY', 'DOY', 'DATE'}
-    temp_cols = [c for c in df_out.columns if c not in exclude_cols]
-    temp_only = df_out[temp_cols].copy()
-    output_arrays.append(temp_only.to_numpy(dtype=np.float32))
+    exclude = {'YEAR','MON','DAY','DOY','DATE'}
+    temp_cols = [c for c in df_out.columns if c not in exclude]
+    if depth_cols_cache is None:
+        depth_cols_cache = temp_cols  # remember order once
 
-# Shape: (N_trials, T_overlap, n_depths)
-output_data = np.stack(output_arrays, axis=0)
-print("output_data.npy shape:", output_data.shape)
+    temps = df_out[temp_cols].to_numpy(np.float32)  # (T, Dz)
+    output_arrays.append(temps)
+
+output_data = np.stack(output_arrays, axis=0)  # (N, T, Dz)
 np.save(os.path.join(OUT_DIR, 'output_data.npy'), output_data)
+print("output_data.npy:", output_data.shape)
