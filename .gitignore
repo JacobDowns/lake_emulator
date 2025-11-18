@@ -89,3 +89,6 @@ pytest_cache/
 outputs/**
 multirun/**
 .optuna/
+*.txt
+*.csv
+*.tsv

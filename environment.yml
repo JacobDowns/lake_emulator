@@ -1,21 +1,9 @@
 name: ml
 channels:
-  - pytorch
-  - nvidia
   - conda-forge
   - defaults
 dependencies:
-  # Core
   - python=3.11
-  - pip
-
-  # PyTorch (GPU) – pulls CUDA runtime; no system CUDA needed
-  - pytorch
-  - torchvision
-  - torchaudio
-  - pytorch-cuda=12.4
-
-  # Data science / viz
   - numpy
   - pandas
   - scipy
@@ -26,31 +14,21 @@ dependencies:
   - matplotlib
   - seaborn
   - plotly
-
-  # Notebooks & VS Code kernel
   - jupyter
   - jupyterlab
   - ipywidgets
-  - ipykernel  # VS Code picks this up
-
-  # Quality-of-life
+  - ipykernel
   - tqdm
   - rich
   - black
   - ruff
-
-  # Optional GPU helpers (feel free to remove if not needed)
-  - cupy
-  - xgboost
-  - lightgbm
-
-  # Computer vision (CPU build; fine for most workflows)
   - opencv
-
-  # Experiment tracking 
   - mlflow
   - sqlalchemy
   - boto3
   - pip
   - pip:
-      - psycopg2-binary
+      - torch
+      - torchvision
+      - torchaudio
+      - --index-url https://download.pytorch.org/whl/cu124
