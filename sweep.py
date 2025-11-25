@@ -23,7 +23,7 @@ from mlflow.tracking import MlflowClient
 # -----------------------------
 
 # MLflow experiment to use
-EXPERIMENT_NAME = os.getenv("MLFLOW_EXPERIMENT_NAME", "Lake-Emu")
+EXPERIMENT_NAME = os.getenv("MLFLOW_EXPERIMENT_NAME", "Long-Predictions")
 
 # Optional: tracking URI (or set this in your shell)
 MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "file:./mlruns")
@@ -37,11 +37,11 @@ LOCK_DIR = os.getenv("SWEEP_LOCK_DIR", ".locks")
 
 # Common non-sweep args (things you *don't* vary here)
 COMMON_ARGS: List[str] = [
-    "--Wy", "1",
-    "--epochs", "40",
+    "--Wy", "90",
+    "--epochs", "5",
     "--batch_size", "256",
     "--smooth_lambda", "0.0",
-    "--split_years", "2018", "2020", "2025",
+    "--split_years", "2019", "2021", "2025",
     "--normalize", "1",
     "--device", "cuda",  # or "cpu"
     "--experiment", EXPERIMENT_NAME,
@@ -49,11 +49,11 @@ COMMON_ARGS: List[str] = [
 
 # Hyperparameter grid (edit this as you like)
 GRID: Dict[str, List[Any]] = {
-    "model": ["rnn"],              # can add "mlp", "cnn"
-    "cell":  ["gru", "lstm"],      # used when model == "rnn"
-    "Wx":    [60, 90, 180, 360],        # window lengths to sweep
-    "hidden": [128, 256],
-    "lr":     [1e-3, 5e-4],
+    "model": ["rnn"],   
+    "cell":  ["gru"],      # used when model == "rnn"
+    "Wx":    [180, 360],
+    "hidden": [256],
+    "lr":     [7e-4],
     "head_hidden": ["256,256"],    # strings passed directly to --head_hidden
 }
 

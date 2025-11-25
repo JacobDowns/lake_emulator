@@ -79,62 +79,76 @@ class ModelMLP(nn.Module, _SqueezeSingleStepMixin):
         return self._maybe_squeeze(y, self.W_y, self.squeeze_output)
 
 class ModelRNN(nn.Module, _SqueezeSingleStepMixin):
-    """
-    RNN/GRU/LSTM over time; take last W_y hidden states; concat params per step; MLP head -> Dz
-    Returns (B, W_y, Dz) or (B, Dz) if W_y==1 and squeeze_output=True
-    """
-    def __init__(
-        self,
-        cell: str = "gru",         # 'gru' | 'lstm' | 'rnn'
-        Du: int = 7,
-        P: int = 6,
-        Dz: int = 8,
-        hidden: int = 128,
-        num_layers: int = 1,
-        rnn_dropout: float = 0.0,  # dropout between stacked recurrent layers (>=2)
-        W_y: int = 1,
-        head_hidden: Union[int, Iterable[int]] = 256,  # MLP head hidden dims
-        head_dropout: float = 0.0,
-        activation: nn.Module = nn.ReLU,
-        squeeze_output: bool = True,
-    ):
+    def __init__(self,
+                 cell="gru", 
+                 Du=7, 
+                 P=6, 
+                 Dz=8,
+                 hidden=128, 
+                 num_layers=2, 
+                 rnn_dropout=0.0,
+                 W_y=1,
+                 head_hidden=256,
+                 head_dropout=0.0,
+                 activation=nn.ReLU,
+                 squeeze_output=True,
+                 param_in_rnn: bool = True,
+                 param_in_head: bool = True
+        ):
         super().__init__()
-        cell = cell.lower()
-        if cell == "gru":
-            self.rnn = nn.GRU(Du, hidden, num_layers=num_layers, batch_first=True, dropout=rnn_dropout if num_layers > 1 else 0.0)
-        elif cell == "lstm":
-            self.rnn = nn.LSTM(Du, hidden, num_layers=num_layers, batch_first=True, dropout=rnn_dropout if num_layers > 1 else 0.0)
-        elif cell in ("rnn", "vanilla"):
-            self.rnn = nn.RNN(Du, hidden, nonlinearity="tanh", num_layers=num_layers, batch_first=True, dropout=rnn_dropout if num_layers > 1 else 0.0)
-        else:
-            raise ValueError("cell must be 'gru', 'lstm', or 'rnn'")
-        self.cell = cell
-        self.hidden = hidden
-        self.W_y = W_y
-        self.Dz = Dz
-        self.P = P
+        self.param_in_rnn = param_in_rnn
+        self.param_in_head = param_in_head
+        self.W_y, self.Dz, self.P = W_y, Dz, P
         self.squeeze_output = squeeze_output
 
-        # MLP head applied per step: (H+P) -> Dz
+        rnn_input_dim = Du + (P if param_in_rnn else 0)
+
+        cell = cell.lower()
+        if cell == "gru":
+            self.rnn = nn.GRU(rnn_input_dim, hidden, num_layers=num_layers,
+                              batch_first=True,
+                              dropout=rnn_dropout if num_layers > 1 else 0.0)
+        elif cell == "lstm":
+            self.rnn = nn.LSTM(rnn_input_dim, hidden, num_layers=num_layers,
+                               batch_first=True,
+                               dropout=rnn_dropout if num_layers > 1 else 0.0)
+        elif cell in ("rnn", "vanilla"):
+            self.rnn = nn.RNN(rnn_input_dim, hidden, nonlinearity="tanh",
+                              num_layers=num_layers,
+                              batch_first=True,
+                              dropout=rnn_dropout if num_layers > 1 else 0.0)
+        else:
+            raise ValueError("cell must be 'gru', 'lstm', or 'rnn'")
+
+        head_in_dim = hidden + (P if param_in_head else 0)
+
         self.head = build_mlp(
-            in_dim=hidden + P,
+            in_dim=head_in_dim,
             hidden_dims=head_hidden,
             out_dim=Dz,
             activation=activation,
             dropout=head_dropout,
         )
 
-    def forward(self, x_win: torch.Tensor, p_vec: torch.Tensor) -> torch.Tensor:
+    def forward(self, x_win, p_vec):
         # x_win: (B, W_x, Du), p_vec: (B, P)
-        out, _ = self.rnn(x_win)              # (B, W_x, H)
-        last_seq = out[:, -self.W_y:, :]      # (B, W_y, H)
-        # Tile params across W_y
-        p_rep = p_vec.unsqueeze(1).expand(-1, self.W_y, -1)   # (B, W_y, P)
-        fused = torch.cat([last_seq, p_rep], dim=-1)          # (B, W_y, H+P)
+        if self.param_in_rnn:
+            p_rep_rnn = p_vec.unsqueeze(1).expand(-1, x_win.size(1), -1)  # (B, W_x, P)
+            x_in = torch.cat([x_win, p_rep_rnn], dim=-1)                   # (B, W_x, Du+P)
+        else:
+            x_in = x_win
 
-        # Apply head per step
-        B, Wy, HP = fused.shape
-        y = self.head(fused.reshape(B * Wy, HP)).reshape(B, Wy, self.Dz)  # (B, W_y, Dz)
+        out, _ = self.rnn(x_in)           # (B, W_x, H)
+        last_seq = out[:, -self.W_y:, :]  # (B, W_y, H)
+
+        if self.param_in_head:
+            p_rep_head = p_vec.unsqueeze(1).expand(-1, self.W_y, -1)  # (B, W_y, P)
+            fused = torch.cat([last_seq, p_rep_head], dim=-1)         # (B, W_y, H+P)
+        else:
+            fused = last_seq                                          # (B, W_y, H)
+
+        B, Wy, F = fused.shape
+        y = self.head(fused.reshape(B * Wy, F)).reshape(B, Wy, self.Dz)
         return self._maybe_squeeze(y, self.W_y, self.squeeze_output)
 
 class ModelCNN1D(nn.Module, _SqueezeSingleStepMixin):
