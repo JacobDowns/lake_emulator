@@ -1,190 +1,248 @@
 #!/usr/bin/env python3
 """
-Resumable sweep launcher for train.py.
+sweep.py
 
-- Defines a grid of hyperparameters, including Wx.
-- For each combo, constructs a run_key that matches train.py.
-- Queries MLflow for runs with that run_key.
-- Skips combos that already have a FINISHED run.
-- Reruns combos that are missing or only FAILED/KILLED/RUNNING.
-- Uses simple lock files to avoid duplicate runs if multiple sweep processes run in parallel.
+Run a hyperparameter sweep over RNN-based lake emulator models using train.py.
+
+Features:
+- Sweeps over Wx, Wy, GRU/LSTM hidden size, depth, head MLP sizes, LR,
+  seasonal features, and attention (on/off, attn_dim).
+- Uses MLflow tags (run_key) to detect whether a configuration has already
+  finished; if so, that combo is skipped (useful for resuming after failure).
 """
 
 import itertools
 import os
-import shlex
 import subprocess
-from typing import Dict, Any, List
+from typing import List
 
+import mlflow
 from mlflow.tracking import MlflowClient
 
+
 # -----------------------------
-# Config
+# Configurable sweep grids
 # -----------------------------
 
-# MLflow experiment to use
-EXPERIMENT_NAME = os.getenv("MLFLOW_EXPERIMENT_NAME", "Long-Predictions")
+EXPERIMENT_NAME = "Emulator Sweep"  # change if you like
 
-# Optional: tracking URI (or set this in your shell)
-MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "file:./mlruns")
+TRAIN_SCRIPT = "train.py"
 
-# Which Python & training script to call
-PYTHON = os.getenv("PYTHON", "python")
-TRAIN_SCRIPT = os.getenv("TRAIN_SCRIPT", "train.py")
+# Window sizes
+WX_LIST = [360]
+WY_LIST = [30]  
 
-# Where to create simple lock files
-LOCK_DIR = os.getenv("SWEEP_LOCK_DIR", ".locks")
+# RNN hyperparameters
+HIDDEN_LIST = [16, 32, 64, 128, 256]     # hidden size
+NUM_LAYERS_LIST = [1, 2, 3]         # RNN depth
 
-# Common non-sweep args (things you *don't* vary here)
-COMMON_ARGS: List[str] = [
-    "--Wy", "90",
-    "--epochs", "5",
-    "--batch_size", "256",
-    "--smooth_lambda", "0.0",
-    "--split_years", "2019", "2021", "2025",
-    "--normalize", "1",
-    "--device", "cuda",  # or "cpu"
-    "--experiment", EXPERIMENT_NAME,
+# MLP head depths: strings must match train.py --head_hidden
+HEAD_HIDDEN_LIST: List[str] = [
+    "16",
+    "32"
+    "64",
+    "128",
+    "256",
+    "16, 16",
+    "32, 32",
+    "64, 64",
+    "128, 128",
+    "256, 256"
 ]
 
-# Hyperparameter grid (edit this as you like)
-GRID: Dict[str, List[Any]] = {
-    "model": ["rnn"],   
-    "cell":  ["gru"],      # used when model == "rnn"
-    "Wx":    [180, 360],
-    "hidden": [256],
-    "lr":     [7e-4],
-    "head_hidden": ["256,256"],    # strings passed directly to --head_hidden
-}
+# Learning rates
+LR_LIST = [2.5e-3]
+
+# Seasonal feature flag: 0 = off, 1 = on
+USE_SEASONAL_LIST = [0, 1]
+
+# Attention flags / dims
+USE_ATTENTION_LIST = [0]           # 0 = off, 1 = on
+ATTN_DIM_LIST = [32]              # only relevant if use_attention=1
+
+# Base training args shared across sweep
+BASE_EPOCHS = 5
+BASE_BATCH_SIZE = 512
+BASE_SMOOTH_LAMBDA = 0.0
+BASE_RNN_DROPOUT = 0.0
+BASE_HEAD_DROPOUT = 0.0
+
+# Fixed cell type for now (can make a list if you want to compare GRU vs LSTM)
+CELL = "gru"
+
 
 # -----------------------------
-# Helpers
+# MLflow helpers
 # -----------------------------
 
-def make_run_key(model: str, cell: str, Wx: int, Wy: int,
-                 hidden: int, lr: float, head_hidden: str) -> str:
+def get_or_create_experiment(experiment_name: str) -> str:
     """
-    Must match the logic used in train.py where we set mlflow.set_tag('run_key', ...):
-
-    run_key = f"{args.model}_cell{args.cell}_Wx{args.Wx}_Wy{args.Wy}_H{args.hidden}_LR{args.lr}_head{args.head_hidden}"
+    Return the experiment_id for the given experiment name,
+    creating it if it does not exist.
     """
-    return f"{model}_cell{cell}_Wx{Wx}_Wy{Wy}_H{hidden}_LR{lr}_head{head_hidden}"
-
-def ensure_experiment(client: MlflowClient, name: str) -> str:
-    exp = client.get_experiment_by_name(name)
+    client = MlflowClient()
+    exp = client.get_experiment_by_name(experiment_name)
     if exp is None:
-        return client.create_experiment(name)
-    return exp.experiment_id
+        exp_id = client.create_experiment(experiment_name)
+    else:
+        exp_id = exp.experiment_id
+    return exp_id
 
-def search_runs_by_key(client: MlflowClient, exp_id: str, key: str):
-    return client.search_runs(
+
+def config_run_key(
+    cell: str,
+    Wx: int,
+    Wy: int,
+    hidden: int,
+    num_layers: int,
+    lr: float,
+    head_hidden: str,
+    use_seasonal: int,
+    use_attention: int,
+    attn_dim: int,
+) -> str:
+    """
+    Must match the run_key format used in train.py.
+    """
+    return (
+        f"rnn_cell{cell}_Wx{Wx}_Wy{Wy}_"
+        f"H{hidden}_L{num_layers}_LR{lr}_head{head_hidden}_"
+        f"seasonal{use_seasonal}_"
+        f"attn{use_attention}_attnDim{attn_dim}"
+    )
+
+
+def is_config_finished(exp_id: str, run_key: str) -> bool:
+    """
+    Check MLflow for any FINISHED run with the given run_key tag in experiment exp_id.
+    If found, we treat that configuration as completed.
+    """
+    client = MlflowClient()
+    filter_str = f"tags.run_key = '{run_key}'"
+    runs = client.search_runs(
         experiment_ids=[exp_id],
-        filter_string=f"tags.run_key = '{key}'",
+        filter_string=filter_str,
         max_results=50,
         order_by=["attributes.start_time DESC"],
     )
-
-def is_finished(client: MlflowClient, exp_id: str, key: str) -> bool:
-    runs = search_runs_by_key(client, exp_id, key)
     for r in runs:
-        if r.info.status == "FINISHED":
+        status = r.info.status
+        if status == "FINISHED":
             return True
     return False
 
-def has_inflight_or_failed(client: MlflowClient, exp_id: str, key: str) -> bool:
-    runs = search_runs_by_key(client, exp_id, key)
-    for r in runs:
-        if r.info.status in ("RUNNING", "SCHEDULED", "FAILED", "KILLED"):
-            return True
-    return False
-
-def acquire_lock(path: str) -> bool:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    try:
-        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        os.close(fd)
-        return True
-    except FileExistsError:
-        return False
-
-def release_lock(path: str):
-    try:
-        os.remove(path)
-    except FileNotFoundError:
-        pass
-
-def arg_value(flag: str, args_list: List[str], default=None):
-    if flag in args_list:
-        idx = args_list.index(flag)
-        if idx < len(args_list) - 1:
-            return args_list[idx + 1]
-    return default
 
 # -----------------------------
 # Main sweep
 # -----------------------------
 
 def main():
-    os.environ["MLFLOW_TRACKING_URI"] = MLFLOW_TRACKING_URI
-    client = MlflowClient()
-    exp_id = ensure_experiment(client, EXPERIMENT_NAME)
+    # Ensure MLflow experiment exists
+    exp_id = get_or_create_experiment(EXPERIMENT_NAME)
+    print(f"Using MLflow experiment '{EXPERIMENT_NAME}' (id={exp_id})")
 
-    # Wy is fixed via COMMON_ARGS
-    Wy_default = int(arg_value("--Wy", COMMON_ARGS, default=1))
+    # Parent directory for artifacts for the sweep
+    os.makedirs("sweep_artifacts", exist_ok=True)
 
-    # Build product of the grid
-    combos = list(itertools.product(
-        GRID["model"],
-        GRID["cell"],
-        GRID["Wx"],
-        GRID["hidden"],
-        GRID["lr"],
-        GRID["head_hidden"],
-    ))
+    # Cartesian product over hyperparameters
+    combo_iter = itertools.product(
+        WX_LIST,
+        WY_LIST,
+        HIDDEN_LIST,
+        NUM_LAYERS_LIST,
+        HEAD_HIDDEN_LIST,
+        LR_LIST,
+        USE_SEASONAL_LIST,
+        USE_ATTENTION_LIST,
+        ATTN_DIM_LIST,
+    )
 
-    print(f"Total combinations: {len(combos)}")
+    for (
+        Wx,
+        Wy,
+        hidden,
+        num_layers,
+        head_hidden,
+        lr,
+        use_seasonal,
+        use_attention,
+        attn_dim,
+    ) in combo_iter:
 
-    for (model, cell, Wx, hidden, lr, head_hidden) in combos:
-        Wy = Wy_default
-
-        key = make_run_key(model, cell, Wx, Wy, hidden, lr, head_hidden)
-
-        if is_finished(client, exp_id, key):
-            print(f"[SKIP] FINISHED: {key}")
+        # Optionally skip attention dims when attention is off
+        if use_attention == 0 and attn_dim != ATTN_DIM_LIST[0]:
+            # To avoid redundant configs when attention is off,
+            # only keep the first attn_dim value in that case.
             continue
 
-        if has_inflight_or_failed(client, exp_id, key):
-            print(f"[RETRY] Previously inflight/failed: {key}")
+        run_key = config_run_key(
+            cell=CELL,
+            Wx=Wx,
+            Wy=Wy,
+            hidden=hidden,
+            num_layers=num_layers,
+            lr=lr,
+            head_hidden=head_hidden,
+            use_seasonal=use_seasonal,
+            use_attention=use_attention,
+            attn_dim=attn_dim,
+        )
 
-        lock_path = os.path.join(LOCK_DIR, f"{key}.lock")
-        if not acquire_lock(lock_path):
-            print(f"[LOCK] Held by another process, skipping: {key}")
+        # Check if this configuration already has a FINISHED run
+        if is_config_finished(exp_id, run_key):
+            print(f"[SKIP] run_key={run_key} already has a FINISHED run.")
             continue
+
+        # Build a unique artifacts directory for this config
+        head_tag = head_hidden.replace(",", "-")
+        season_tag = f"seasonal{use_seasonal}"
+        attn_tag = f"attn{use_attention}_attnDim{attn_dim}"
+        artifacts_dir = os.path.join(
+            "sweep_artifacts",
+            f"rnn_cell{CELL}_Wx{Wx}_Wy{Wy}_H{hidden}_L{num_layers}_"
+            f"head{head_tag}_lr{lr}_{season_tag}_{attn_tag}"
+        )
+        os.makedirs(artifacts_dir, exist_ok=True)
+
+        # Construct command line for train.py
+        cmd = [
+            "python", TRAIN_SCRIPT,
+            f"--Wx={Wx}",
+            f"--Wy={Wy}",
+            f"--hidden={hidden}",
+            f"--num_layers={num_layers}",
+            f"--head_hidden={head_hidden}",
+            f"--lr={lr}",
+            f"--epochs={BASE_EPOCHS}",
+            f"--batch_size={BASE_BATCH_SIZE}",
+            f"--smooth_lambda={BASE_SMOOTH_LAMBDA}",
+            f"--rnn_dropout={BASE_RNN_DROPOUT}",
+            f"--head_dropout={BASE_HEAD_DROPOUT}",
+            f"--cell={CELL}",
+            f"--artifacts={artifacts_dir}",
+            f"--experiment={EXPERIMENT_NAME}",
+            f"--attn_dim={attn_dim}",
+        ]
+
+        if use_seasonal:
+            cmd.append("--use_seasonal_features")
+        if use_attention:
+            cmd.append("--use_attention")
+
+        print("\n========================================")
+        print("Running config:")
+        print(f"  Wx={Wx}, Wy={Wy}, hidden={hidden}, num_layers={num_layers},")
+        print(f"  head_hidden={head_hidden}, lr={lr}, "
+              f"use_seasonal={use_seasonal}, use_attention={use_attention}, attn_dim={attn_dim}")
+        print("run_key:", run_key)
+        print("artifacts:", artifacts_dir)
+        print("Command:", " ".join(cmd))
+        print("========================================\n")
 
         try:
-            # Compose command
-            cmd = [
-                PYTHON, TRAIN_SCRIPT,
-                "--model", model,
-                "--cell", cell,
-                "--Wx", str(Wx),
-                "--hidden", str(hidden),
-                "--lr", f"{lr:g}",
-                "--head_hidden", head_hidden,
-            ] + COMMON_ARGS
-
-            print(f"[RUN ] {key}")
-            print(f"  CMD: {' '.join(shlex.quote(c) for c in cmd)}")
-
-            env = os.environ.copy()
-            env["MLFLOW_TRACKING_URI"] = MLFLOW_TRACKING_URI
-            env["MLFLOW_EXPERIMENT_NAME"] = EXPERIMENT_NAME
-
-            subprocess.run(cmd, check=True, env=env)
-        finally:
-            release_lock(lock_path)
-
-    print("\nSweep complete (skipped FINISHED, reran unfinished/failed).")
+            subprocess.run(cmd, check=True)
+        except subprocess.CalledProcessError as e:
+            print(f"[ERROR] Training failed for run_key={run_key} with return code {e.returncode}")
 
 
 if __name__ == "__main__":

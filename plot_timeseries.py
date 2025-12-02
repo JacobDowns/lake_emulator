@@ -11,8 +11,8 @@ import matplotlib.pyplot as plt
 
 from mlflow.tracking import MlflowClient
 
-# Your model definitions & data loader from training code
-from models import ModelMLP, ModelRNN, ModelCNN1D
+# Your model definition & data loader from training code
+from models import ModelRNN
 from train import load_data  # reuse exact same normalization / splitting
 
 
@@ -50,6 +50,22 @@ def denorm_outputs(y_norm: np.ndarray, norms: dict) -> np.ndarray:
 
 
 # ---------------------------
+# Seasonal features (match train.py)
+# ---------------------------
+
+def build_seasonal_features(doy: np.ndarray) -> np.ndarray:
+    """
+    Build a cyclic encoding of day-of-year.
+    doy: (T,) with values in [1,365] or [0,364]
+    Returns: (T, 2) array with sin/cos(2π * doy / 365).
+    """
+    angle = 2.0 * np.pi * (doy / 365.0)
+    sin_doy = np.sin(angle)
+    cos_doy = np.cos(angle)
+    return np.stack([sin_doy, cos_doy], axis=-1).astype(np.float32)  # (T, 2)
+
+
+# ---------------------------
 # MLflow checkpoint loading
 # ---------------------------
 
@@ -67,66 +83,67 @@ def load_checkpoint_from_mlflow(run_id: str, dst_dir: str = "downloaded_artifact
 
 
 # ---------------------------
-# Model reconstruction
+# Model reconstruction (RNN only)
 # ---------------------------
 
 def build_model_from_config(cfg, Du, Dz, P):
     """
-    Rebuild the model based on the saved training config (cfg) and data dims.
+    Rebuild the RNN model based on the saved training config (cfg) and data dims.
     """
     model_type = cfg.get("model", "rnn")
-    Wx = cfg["Wx"]
-    Wy = cfg["Wy"]
+    if model_type != "rnn":
+        raise ValueError(f"plot script expects an RNN model, but cfg['model']={model_type}")
+
+    Wx = int(cfg["Wx"])
+    Wy = int(cfg["Wy"])
 
     head_hidden_str = cfg.get("head_hidden", "256,256")
     head_hidden = [int(x) for x in str(head_hidden_str).split(",") if x.strip()]
     head_dropout = float(cfg.get("head_dropout", 0.0))
 
-    if model_type == "mlp":
-        model = ModelMLP(
-            W_x=Wx,
-            Du=Du,
-            P=P,
-            Dz=Dz,
-            W_y=Wy,
-            mlp_hidden=head_hidden,
-            mlp_dropout=head_dropout,
-        )
-    elif model_type == "rnn":
-        cell = cfg.get("cell", "gru")
-        hidden = int(cfg.get("hidden", 128))
-        num_layers = int(cfg.get("num_layers", 1))
-        rnn_dropout = float(cfg.get("rnn_dropout", 0.0))
-        model = ModelRNN(
-            cell=cell,
-            Du=Du,
-            P=P,
-            Dz=Dz,
-            hidden=hidden,
-            num_layers=num_layers,
-            rnn_dropout=rnn_dropout,
-            W_y=Wy,
-            head_hidden=head_hidden,
-            head_dropout=head_dropout,
-        )
-    elif model_type == "cnn":
-        cnn_layers = int(cfg.get("cnn_layers", 2))
-        cnn_channels = int(cfg.get("cnn_channels", 128))
-        cnn_kernel = int(cfg.get("cnn_kernel", 5))
-        model = ModelCNN1D(
-            Du=Du,
-            P=P,
-            Dz=Dz,
-            W_y=Wy,
-            layers=cnn_layers,
-            channels=cnn_channels,
-            kernel=cnn_kernel,
-            head_hidden=head_hidden,
-            head_dropout=head_dropout,
-        )
-    else:
-        raise ValueError(f"Unknown model type: {model_type}")
+    cell = cfg.get("cell", "gru")
+    hidden = int(cfg.get("hidden", 128))
+    num_layers = int(cfg.get("num_layers", 1))
+    rnn_dropout = float(cfg.get("rnn_dropout", 0.0))
 
+    # Attention flags (may be stored as bool or int)
+    use_attention_raw = cfg.get("use_attention", 0)
+    if isinstance(use_attention_raw, str):
+        use_attention = bool(int(use_attention_raw))
+    else:
+        use_attention = bool(use_attention_raw)
+
+    attn_dim = int(cfg.get("attn_dim", 64))
+
+    # Optional flags for parameter injection (if you later add them)
+    param_in_rnn_raw = cfg.get("param_in_rnn", 1)
+    if isinstance(param_in_rnn_raw, str):
+        param_in_rnn = bool(int(param_in_rnn_raw))
+    else:
+        param_in_rnn = bool(param_in_rnn_raw)
+
+    param_in_head_raw = cfg.get("param_in_head", 1)
+    if isinstance(param_in_head_raw, str):
+        param_in_head = bool(int(param_in_head_raw))
+    else:
+        param_in_head = bool(param_in_head_raw)
+
+    model = ModelRNN(
+        cell=cell,
+        Du=Du,
+        P=P,
+        Dz=Dz,
+        hidden=hidden,
+        num_layers=num_layers,
+        rnn_dropout=rnn_dropout,
+        W_y=Wy,
+        head_hidden=head_hidden,
+        head_dropout=head_dropout,
+        use_attention=use_attention,
+        attn_dim=attn_dim,
+        param_in_rnn=param_in_rnn,
+        param_in_head=param_in_head,
+    )
     return model
 
 
@@ -140,15 +157,16 @@ def make_time_series_plots_for_run(
     max_days: int = None,
     device: str = None,
     outdir: str = "plots_timeseries",
-    split: str = "test",   # "train" | "val" | "test"
+    split: str = "test",   # "train" | "val" | "test" | "valtest" | "val+test"
 ):
     """
     For a given MLflow run:
       - load best checkpoint
       - rebuild model
       - reload data with the same splits & normalization
+      - optionally concatenate val+test into one continuous period
       - for a few random simulations (parameter sets),
-        run the model over the chosen split and plot:
+        run the model over the chosen period and plot:
           * time series (True vs Pred + ΔT)
           * heatmaps (True, Pred, ΔT)
 
@@ -160,8 +178,9 @@ def make_time_series_plots_for_run(
     # 1) Load checkpoint & config
     ckpt_path, ckpt = load_checkpoint_from_mlflow(run_id)
     cfg = ckpt["config"]  # this is vars(args) from train.py
-    Wx = cfg["Wx"]
-    Wy = cfg["Wy"]
+    Wx = int(cfg["Wx"])
+    Wy = int(cfg["Wy"])
+    use_seasonal = int(cfg.get("use_seasonal_features", 0)) != 0
 
     if device is None:
         device = cfg.get("device", "cuda" if torch.cuda.is_available() else "cpu")
@@ -180,53 +199,106 @@ def make_time_series_plots_for_run(
         normalize=True,
     )
 
-    if split == "train":
-        weather = data["weather_data_train"]   # (T, Du)
-        outputs = data["output_data_train"]    # (N, T, Dz)
-    elif split == "val":
-        weather = data["weather_data_val"]
-        outputs = data["output_data_val"]
-    elif split == "test":
-        weather = data["weather_data_test"]
-        outputs = data["output_data_test"]
-    else:
-        raise ValueError("split must be one of 'train', 'val', 'test'")
+    # Base arrays for each split
+    w_tr = data["weather_data_train"]
+    w_va = data["weather_data_val"]
+    w_te = data["weather_data_test"]
+
+    o_tr = data["output_data_train"]
+    o_va = data["output_data_val"]
+    o_te = data["output_data_test"]
+
+    doy_tr = data["doy_train"]
+    doy_va = data["doy_val"]
+    doy_te = data["doy_test"]
 
     params = data["params_data"]               # (N, P)
     norms = data["norms"]
 
-    T_split, Du = weather.shape
-    N, T_out, Dz = outputs.shape
-    assert T_split == T_out, "Time dimension mismatch for chosen split."
+    # Choose which period to visualize
+    if split == "train":
+        weather_drivers = w_tr           # (T_train, Du)
+        outputs = o_tr                   # (N, T_train, Dz)
+        doy = doy_tr                     # (T_train,)
+        label_prefix = "Train"
+    elif split == "val":
+        weather_drivers = w_va
+        outputs = o_va
+        doy = doy_va
+        label_prefix = "Validation"
+    elif split == "test":
+        weather_drivers = w_te
+        outputs = o_te
+        doy = doy_te
+        label_prefix = "Test"
+    elif split in ("valtest", "val+test"):
+        # Concatenate validation + test along time dimension
+        weather_drivers = np.concatenate([w_va, w_te], axis=0)       # (T_val+T_test, Du)
+        outputs = np.concatenate([o_va, o_te], axis=1)               # (N, T_val+T_test, Dz)
+        doy = np.concatenate([doy_va, doy_te], axis=0)               # (T_val+T_test,)
+        label_prefix = "Val+Test"
+        split = "valtest"  # normalize name for filenames
+    else:
+        raise ValueError("split must be one of 'train', 'val', 'test', 'valtest', 'val+test'")
 
-    P = params.shape[1]
+    # Add seasonal features if the model was trained with them
+    if use_seasonal:
+        extra = build_seasonal_features(doy)                # (T_period, 2)
+        weather = np.concatenate([weather_drivers, extra], axis=-1)  # (T_period, Du+2)
+    else:
+        weather = weather_drivers
+
+    T_period, Du_current = weather.shape
+    N, T_out, Dz_current = outputs.shape
+    assert T_period == T_out, "Time dimension mismatch for chosen period."
+
+    # Data dims (from checkpoint if present)
+    Du_model = int(ckpt.get("Du", Du_current))
+    Dz_model = int(ckpt.get("Dz", Dz_current))
+    P_model  = int(ckpt.get("P", params.shape[1]))
+
+    # Sanity check: feature dims must match what the model expects
+    if Du_model != Du_current:
+        raise ValueError(
+            f"Input feature dimension mismatch: model Du={Du_model}, "
+            f"but weather has Du={Du_current}. "
+            f"(Did you forget seasonal features or change preprocessing?)"
+        )
+    if Dz_model != Dz_current:
+        raise ValueError(
+            f"Output depth dimension mismatch: model Dz={Dz_model}, "
+            f"but outputs have Dz={Dz_current}."
+        )
+
+    Dz = Dz_model
+    P = P_model
 
     # 3) Rebuild model and load weights
-    model = build_model_from_config(cfg, Du, Dz, P)
+    model = build_model_from_config(cfg, Du_model, Dz_model, P_model)
     model.load_state_dict(ckpt["state_dict"])
     model.to(device)
     model.eval()
 
     # 4) Choose random simulation indices
-    all_ids = list(range(N))
+    all_ids = list(range(params.shape[0]))
     random.shuffle(all_ids)
-    chosen_ids = all_ids[: min(num_sims, N)]
+    chosen_ids = all_ids[: min(num_sims, len(all_ids))]
 
-    # 5) Generate predictions over full chosen split for each sim
-    if T_split < Wx:
-        raise ValueError(f"Period too short (T={T_split}) for Wx={Wx}.")
-    print(f"Generating predictions over {split} period: T={T_split}, Wx={Wx}, Wy={Wy}")
+    # 5) Generate predictions over full chosen period for each sim
+    if T_period < Wx:
+        raise ValueError(f"Period too short (T={T_period}) for Wx={Wx}.")
+    print(f"Generating predictions over {label_prefix} period: T={T_period}, Wx={Wx}, Wy={Wy}")
 
-    num_windows = T_split - Wx + 1
+    num_windows = T_period - Wx + 1
 
     for n in chosen_ids:
         p_vec = torch.from_numpy(params[n]).to(device=device, dtype=torch.float32)  # (P,)
 
-        # We'll accumulate predictions and counts for averaging overlaps
-        preds_sum = np.zeros((T_split, Dz), dtype=np.float32)
-        preds_count = np.zeros(T_split, dtype=np.int32)
+        # Accumulate predictions and counts for averaging overlaps
+        preds_sum = np.zeros((T_period, Dz), dtype=np.float32)
+        preds_count = np.zeros(T_period, dtype=np.int32)
 
-        truth = outputs[n].copy()  # (T_split, Dz), still normalized
+        truth = outputs[n].copy()  # (T_period, Dz), still normalized
 
         # For each window starting at 'start' with indices [start ... start+Wx-1]:
         # the model predicts Wy steps aligned to the LAST Wy days of the window.
@@ -234,7 +306,7 @@ def make_time_series_plots_for_run(
         #   t_idx = start + (Wx - Wy) + j,  j = 0 .. Wy-1
         for start in range(num_windows):
             end = start + Wx
-            x_win = weather[start:end, :]   # (Wx, Du)
+            x_win = weather[start:end, :]   # (Wx, Du_model)
             x_win_t = torch.from_numpy(x_win).unsqueeze(0).to(device=device, dtype=torch.float32)  # (1, Wx, Du)
             p_t = p_vec.unsqueeze(0)  # (1, P)
 
@@ -247,20 +319,20 @@ def make_time_series_plots_for_run(
 
             for j in range(Wy):
                 t_idx = start + (Wx - Wy) + j
-                if 0 <= t_idx < T_split:
+                if 0 <= t_idx < T_period:
                     preds_sum[t_idx, :] += y_pred_np[j, :]
                     preds_count[t_idx] += 1
 
         # Build final preds array, average where we have coverage
-        preds = np.full((T_split, Dz), np.nan, dtype=np.float32)
+        preds = np.full((T_period, Dz), np.nan, dtype=np.float32)
         valid_mask = preds_count > 0
         preds[valid_mask, :] = (
             preds_sum[valid_mask, :] / preds_count[valid_mask][:, None]
         )
 
         # De-normalize true and predicted
-        truth_denorm_full = denorm_outputs(truth, norms)  # (T_split, Dz)
-        preds_denorm_full = denorm_outputs(preds, norms)  # (T_split, Dz) with NaNs for unpredicted times
+        truth_denorm_full = denorm_outputs(truth, norms)  # (T_period, Dz)
+        preds_denorm_full = denorm_outputs(preds, norms)  # (T_period, Dz) with NaNs for unpredicted times
 
         # Restrict to indices where we have predictions
         valid_indices = np.where(valid_mask)[0]
@@ -278,7 +350,7 @@ def make_time_series_plots_for_run(
         truth_denorm = truth_denorm_full[t_min:t_max+1, :]  # (T_plot, Dz)
         preds_denorm = preds_denorm_full[t_min:t_max+1, :]  # (T_plot, Dz)
         T_plot = truth_denorm.shape[0]
-        time_axis = np.arange(t_min, t_min + T_plot)
+        time_axis = np.arange(T_plot)  # days since start of plotted period
 
         # Choose a few representative depths (surface, mid, bottom)
         if Dz >= 3:
@@ -324,9 +396,11 @@ def make_time_series_plots_for_run(
             diff_ax.grid(True, alpha=0.3)
             diff_ax.legend(loc="upper right")
 
-        axes_pairs[-1][1].set_xlabel(f"{split.capitalize()} time index (days since start of {split} period)")
+        axes_pairs[-1][1].set_xlabel(
+            f"{label_prefix} time index (days since start of {label_prefix.lower()} period)"
+        )
 
-        fig_ts.suptitle(f"{split.capitalize()} time series | Run {run_id} | sim n={n} | Wx={Wx}, Wy={Wy}")
+        fig_ts.suptitle(f"{label_prefix} time series | Run {run_id} | sim n={n} | Wx={Wx}, Wy={Wy}")
         fig_ts.tight_layout(rect=[0, 0.03, 1, 0.95])
 
         fname_ts = os.path.join(outdir, f"{split}_timeseries_run_{run_id}_sim_{n}.png")
@@ -357,7 +431,9 @@ def make_time_series_plots_for_run(
                 cmap=cmap,
             )
             ax.set_title(title)
-            ax.set_xlabel(f"{split.capitalize()} time index (days since start of {split} period)")
+            ax.set_xlabel(
+                f"{label_prefix} time index (days since start of {label_prefix.lower()} period)"
+            )
             return im
 
         # Common color limits for True/Pred
@@ -384,7 +460,7 @@ def make_time_series_plots_for_run(
         cbar2 = fig_h.colorbar(im2, ax=axes_h[2], fraction=0.046, pad=0.04)
         cbar2.set_label("ΔT (°C)")
 
-        fig_h.suptitle(f"{split.capitalize()} heatmaps | Run {run_id} | sim n={n} | Wx={Wx}, Wy={Wy}")
+        fig_h.suptitle(f"{label_prefix} heatmaps | Run {run_id} | sim n={n} | Wx={Wx}, Wy={Wy}")
         fig_h.tight_layout(rect=[0, 0.03, 1, 0.92])
 
         fname_h = os.path.join(outdir, f"{split}_heatmaps_run_{run_id}_sim_{n}.png")
@@ -404,8 +480,12 @@ def main():
     ap.add_argument("--max_days", type=int, default=None, help="Optional limit on number of days to plot")
     ap.add_argument("--device", default=None, help="Override device (cpu/cuda), default uses run config or auto")
     ap.add_argument("--outdir", default="plots_timeseries", help="Directory to save plots")
-    ap.add_argument("--split", default="test", choices=["train", "val", "test"],
-                    help="Which split to plot (default: test)")
+    ap.add_argument(
+        "--split",
+        default="test",
+        choices=["train", "val", "test", "valtest", "val+test"],
+        help="Which period to plot (default: test; 'valtest' = val+test combined)",
+    )
     args = ap.parse_args()
 
     make_time_series_plots_for_run(

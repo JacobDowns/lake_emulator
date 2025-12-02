@@ -51,6 +51,9 @@ mlruns/
 artifacts*/
 artifacts_*/
 
+# JSON files
+*.json
+
 # --- Models / checkpoints ---
 *.pt
 *.pth

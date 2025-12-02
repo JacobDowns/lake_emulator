@@ -12,152 +12,12 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 # ---- your models ----
-from models import ModelMLP, ModelRNN, ModelCNN1D
+from models import ModelRNN
 
 # ---- MLflow ----
 import mlflow
 import mlflow.pytorch
-
-
-# =========================================================
-# Data loading (train-only normalization; strip YEAR/DOY)
-# =========================================================
-def load_data(
-    weather_path='data/parsed_data/weather_data.npy',
-    output_path ='data/parsed_data/output_data.npy',
-    params_path ='data/parsed_data/parameter_data.npy',
-    split_years = [2018, 2020, 2025],  # [train_end, val_end, max]
-    normalize = True
-):
-    """
-    Returns dict of splits with train-only normalization applied:
-      weather_data_* : (T_split, Du=7)  # YEAR/DOY removed
-      output_data_*  : (N, T_split, Dz=8)
-      params_data    : (N, P)
-      norms          : dict with means/stds for inverse-transform
-
-    YEAR used only for splitting. DOY is ignored here (you can add cyc features upstream if desired).
-    """
-    weather = np.load(weather_path)   # (T, 2 + Du) : [YEAR, DOY, drivers...]
-    outputs = np.load(output_path)    # (N, T, Dz)
-    params  = np.load(params_path)    # (N, P)
-
-    year = weather[:, 0]
-    drivers = weather[:, 2:]          # (T, Du)
-
-    # splits
-    idx_train = (year <= split_years[0])
-    idx_val   = (year > split_years[0]) & (year <= split_years[1])
-    idx_test  = (year > split_years[1])
-
-    weather_train = drivers[idx_train, :]
-    weather_val   = drivers[idx_val, :]
-    weather_test  = drivers[idx_test, :]
-
-    outputs_train = outputs[:, idx_train, :]
-    outputs_val   = outputs[:, idx_val, :]
-    outputs_test  = outputs[:, idx_test, :]
-
-    if normalize:
-        eps = 1e-6
-        w_mean = weather_train.mean(axis=0, keepdims=True)         # (1, Du)
-        w_std  = weather_train.std(axis=0, keepdims=True) + eps    # (1, Du)
-
-        o_mean = outputs_train.mean(axis=(0,1), keepdims=True)     # (1, 1, Dz)
-        o_std  = outputs_train.std(axis=(0,1), keepdims=True) + eps# (1, 1, Dz)
-
-        p_mean = params.mean(axis=0, keepdims=True)                # (1, P)
-        p_std  = params.std(axis=0, keepdims=True) + eps           # (1, P)
-
-        weather_train = (weather_train - w_mean) / w_std
-        weather_val   = (weather_val   - w_mean) / w_std
-        weather_test  = (weather_test  - w_mean) / w_std
-
-        outputs_train = (outputs_train - o_mean) / o_std
-        outputs_val   = (outputs_val   - o_mean) / o_std
-        outputs_test  = (outputs_test  - o_mean) / o_std
-
-        params = (params - p_mean) / p_std
-
-        norms = {
-            "weather_mean": w_mean.astype(np.float32),   # (1, Du)
-            "weather_std":  w_std.astype(np.float32),    # (1, Du)
-            "output_mean":  o_mean.astype(np.float32),   # (1, 1, Dz)
-            "output_std":   o_std.astype(np.float32),    # (1, 1, Dz)
-            "params_mean":  p_mean.astype(np.float32),   # (1, P)
-            "params_std":   p_std.astype(np.float32),    # (1, P)
-        }
-    else:
-        norms = None
-
-    return {
-        "weather_data_train": weather_train.astype(np.float32),
-        "output_data_train":  outputs_train.astype(np.float32),
-        "weather_data_val":   weather_val.astype(np.float32),
-        "output_data_val":    outputs_val.astype(np.float32),
-        "weather_data_test":  weather_test.astype(np.float32),
-        "output_data_test":   outputs_test.astype(np.float32),
-        "params_data":        params.astype(np.float32),
-        "norms":              norms
-    }
-
-
-# =========================================================
-# Dataset: windowing over arrays returned by load_data
-# =========================================================
-class LakeWindowDataset(Dataset):
-    """
-    Given:
-      weather: (T, Du)
-      outputs: (N, T, Dz)
-      params : (N, P)
-
-    For window length W_x and horizon W_y (<= W_x):
-      x_win: (W_x, Du)
-      p_vec: (P,)
-      y    : (W_y, Dz)  (we squeeze y to (Dz) in the loop if W_y==1)
-    """
-    def __init__(self, weather: np.ndarray, outputs: np.ndarray, params: np.ndarray,
-                 W_x: int = 90, W_y: int = 1, trial_ids=None):
-        super().__init__()
-        assert 1 <= W_y <= W_x, "Require 1 <= W_y <= W_x"
-        assert weather.ndim == 2 and outputs.ndim == 3 and params.ndim == 2
-        T, Du = weather.shape
-        N, T2, Dz = outputs.shape
-        assert T == T2 and N == params.shape[0]
-        self.W_x, self.W_y = W_x, W_y
-        self.Du, self.Dz = Du, Dz
-        self.params = torch.from_numpy(params).float()
-        self.outputs = outputs  # keep numpy for cheap slicing
-        if trial_ids is None:
-            self.trial_ids = np.arange(N, dtype=int)
-        else:
-            self.trial_ids = np.array(trial_ids, dtype=int)
-
-        # Precompute weather windows (T - W_x + 1, W_x, Du)
-        if T < W_x:
-            raise ValueError(f"Not enough timesteps T={T} for W_x={W_x}")
-        W = T - W_x + 1
-        self.W = W
-        wv = np.lib.stride_tricks.sliding_window_view(weather, window_shape=(W_x, Du), axis=(0, 1))
-        self.weather_wins = torch.from_numpy(wv[:, 0, :, :]).float()  # (W, W_x, Du)
-
-        # index over all (n, w)
-        self.index = [(i, w) for i in range(len(self.trial_ids)) for w in range(W)]
-
-    def __len__(self): return len(self.index)
-
-    def __getitem__(self, k: int):
-        i_idx, w = self.index[k]
-        n = self.trial_ids[i_idx]
-        x_win = self.weather_wins[w]                         # (W_x, Du)
-        p_vec = self.params[n]                               # (P,)
-        start = w + self.W_x - self.W_y
-        end   = w + self.W_x
-        y_np  = self.outputs[n, start:end, :]                # (W_y, Dz)
-        y = torch.from_numpy(y_np).float()
-        return x_win, p_vec, y
-
+from lake_dataset import LakeWindowDataset, load_data, build_seasonal_features
 
 # =========================================================
 # Training / eval / plotting
@@ -167,7 +27,7 @@ def train_one_epoch(loader, model, opt, device, smooth_lambda=0.0):
     mse = nn.MSELoss()
     total, count = 0.0, 0
     for x, p, y in loader:
-        x = x.to(device).float()    # (B, W_x, Du)
+        x = x.to(device).float()    # (B, W_x, Du_total)
         p = p.to(device).float()    # (B, P)
         y = y.to(device).float()    # (B, W_y, Dz) or (B, Dz) later
 
@@ -350,8 +210,7 @@ def main():
     ap.add_argument("--Wx", type=int, default=90, help="window length (days)")
     ap.add_argument("--Wy", type=int, default=1, help="prediction horizon (days)")
 
-    # model choice & hypers
-    ap.add_argument("--model", choices=["mlp","rnn","cnn"], default="rnn")
+    # MLP head hypers
     ap.add_argument("--head_hidden", type=str, default="256,256")
     ap.add_argument("--head_dropout", type=float, default=0.0)
 
@@ -361,17 +220,22 @@ def main():
     ap.add_argument("--num_layers", type=int, default=2)
     ap.add_argument("--rnn_dropout", type=float, default=0.0)
 
-    # CNN specifics
-    ap.add_argument("--cnn_layers", type=int, default=2)
-    ap.add_argument("--cnn_channels", type=int, default=128)
-    ap.add_argument("--cnn_kernel", type=int, default=5)
+    # Attention
+    ap.add_argument("--use_attention", action="store_true",
+                    help="Use parameter-conditioned temporal attention over the window")
+    ap.add_argument("--attn_dim", type=int, default=64,
+                    help="Attention hidden dimension (if use_attention)")
 
     # training
     ap.add_argument("--epochs", type=int, default=50)
-    ap.add_argument("--batch_size", type=int, default=256)
-    ap.add_argument("--lr", type=float, default=7.5e-3)
+    ap.add_argument("--batch_size", type=int, default=512)
+    ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--smooth_lambda", type=float, default=0.0)
     ap.add_argument("--seed", type=int, default=42)
+
+    # extra features
+    ap.add_argument("--use_seasonal_features", action="store_true",
+                    help="Include DOY sin/cos as extra inputs")
 
     # infra
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -396,36 +260,59 @@ def main():
     w_tr = data["weather_data_train"];  o_tr = data["output_data_train"]
     w_va = data["weather_data_val"];    o_va = data["output_data_val"]
     w_te = data["weather_data_test"];   o_te = data["output_data_test"]
+    doy_tr = data["doy_train"];         doy_va = data["doy_val"];  doy_te = data["doy_test"]
     params = data["params_data"]
     norms  = data["norms"]
 
-    Du = w_tr.shape[1]
     Dz = o_tr.shape[2]
     P  = params.shape[1]
 
+    # ---------- build extra features (e.g. seasonal) if requested
+    extra_tr = extra_va = extra_te = None
+    if args.use_seasonal_features:
+        extra_tr = build_seasonal_features(doy_tr)   # (T_train, 2)
+        extra_va = build_seasonal_features(doy_va)   # (T_val, 2)
+        extra_te = build_seasonal_features(doy_te)   # (T_test, 2)
+
     # ---------- datasets & loaders
-    train_ds = LakeWindowDataset(w_tr, o_tr, params, W_x=args.Wx, W_y=args.Wy)
-    val_ds   = LakeWindowDataset(w_va, o_va, params, W_x=args.Wx, W_y=args.Wy)
-    test_ds  = LakeWindowDataset(w_te, o_te, params, W_x=args.Wx, W_y=args.Wy)
+    train_ds = LakeWindowDataset(
+        w_tr, o_tr, params, W_x=args.Wx, W_y=args.Wy,
+        extra_features=extra_tr
+    )
+    val_ds   = LakeWindowDataset(
+        w_va, o_va, params, W_x=args.Wx, W_y=args.Wy,
+        extra_features=extra_va
+    )
+    test_ds  = LakeWindowDataset(
+        w_te, o_te, params, W_x=args.Wx, W_y=args.Wy,
+        extra_features=extra_te
+    )
+
+    # After adding extra features, Du is the dataset's feature dimension
+    Du = train_ds.Du
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,  num_workers=0)
     val_loader   = DataLoader(val_ds,   batch_size=max(1, args.batch_size//2), shuffle=False, num_workers=0)
     test_loader  = DataLoader(test_ds,  batch_size=max(1, args.batch_size//2), shuffle=False, num_workers=0)
 
-    # ---------- model
+    #  RNN model only
     head_hidden = parse_hidden_list(args.head_hidden)
-    if args.model == "mlp":
-        model = ModelMLP(W_x=args.Wx, Du=Du, P=P, Dz=Dz, W_y=args.Wy,
-                         mlp_hidden=head_hidden, mlp_dropout=args.head_dropout)
-    elif args.model == "rnn":
-        model = ModelRNN(cell=args.cell, Du=Du, P=P, Dz=Dz,
-                         hidden=args.hidden, num_layers=args.num_layers,
-                         rnn_dropout=args.rnn_dropout,
-                         W_y=args.Wy, head_hidden=head_hidden, head_dropout=args.head_dropout)
-    else:
-        model = ModelCNN1D(Du=Du, P=P, Dz=Dz, W_y=args.Wy,
-                           layers=args.cnn_layers, channels=args.cnn_channels, kernel=args.cnn_kernel,
-                           head_hidden=head_hidden, head_dropout=args.head_dropout)
+    model = ModelRNN(
+        cell=args.cell,
+        Du=Du,
+        P=P,
+        Dz=Dz,
+        hidden=args.hidden,
+        num_layers=args.num_layers,
+        rnn_dropout=args.rnn_dropout,
+        W_y=args.Wy,
+        head_hidden=head_hidden,
+        head_dropout=args.head_dropout,
+        # attention
+        use_attention=args.use_attention,
+        attn_dim=args.attn_dim,
+    )
+
     device = args.device
     model = model.to(device)
 
@@ -437,32 +324,38 @@ def main():
     # ---------- MLflow
     exp_name = args.experiment or os.getenv("MLFLOW_EXPERIMENT_NAME", "Lake-Emu")
     mlflow.set_experiment(exp_name)
-    run_name = f"{args.model.upper()}_Wx{args.Wx}_Wy{args.Wy}"
+    run_name = f"RNN_Wx{args.Wx}_Wy{args.Wy}"
     with mlflow.start_run(run_name=run_name):
         log_git_info_as_tags()
-        run_key = f"{args.model}_cell{args.cell}_Wx{args.Wx}_Wy{args.Wy}_H{args.hidden}_LR{args.lr}_head{args.head_hidden}"
+        run_key = (
+            f"rnn_cell{args.cell}_Wx{args.Wx}_Wy{args.Wy}_"
+            f"H{args.hidden}_L{args.num_layers}_LR{args.lr}_head{args.head_hidden}_"
+            f"seasonal{int(args.use_seasonal_features)}_"
+            f"attn{int(args.use_attention)}_attnDim{args.attn_dim}"
+        )
         mlflow.set_tag("run_key", run_key)
         mlflow.log_params({
-            "model": args.model, 
+            "model": "rnn",
             "cell": args.cell,
-            "Wx": args.Wx, 
+            "Wx": args.Wx,
             "Wy": args.Wy,
-            "Du": Du, 
-            "Dz": Dz, "P": P,
-            "hidden": args.hidden, 
-            "num_layers": args.num_layers, 
+            "Du": Du,
+            "Dz": Dz,
+            "P": P,
+            "hidden": args.hidden,
+            "num_layers": args.num_layers,
             "rnn_dropout": args.rnn_dropout,
-            "cnn_layers": args.cnn_layers, 
-            "cnn_channels": args.cnn_channels, 
-            "cnn_kernel": args.cnn_kernel,
-            "head_hidden": args.head_hidden, 
+            "head_hidden": args.head_hidden,
             "head_dropout": args.head_dropout,
-            "epochs": args.epochs, 
-            "batch_size": args.batch_size, 
+            "epochs": args.epochs,
+            "batch_size": args.batch_size,
             "lr": args.lr,
-            "smooth_lambda": args.smooth_lambda, 
+            "smooth_lambda": args.smooth_lambda,
             "device": device,
-            "split_years": ",".join(map(str, args.split_years))
+            "split_years": ",".join(map(str, args.split_years)),
+            "use_seasonal_features": int(args.use_seasonal_features),
+            "use_attention": int(args.use_attention),
+            "attn_dim": args.attn_dim,
         })
         mlflow.log_metric("num_params", sum(p.numel() for p in model.parameters()))
 
