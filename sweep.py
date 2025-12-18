@@ -2,84 +2,72 @@
 """
 sweep.py
 
-Run a hyperparameter sweep over RNN-based lake emulator models using train.py.
+Sweep only:
+- smoothed weather input windows (including "none")
+- rnn_dropout
+- head_dropout
+- smooth_lambda
 
-Features:
-- Sweeps over Wx, Wy, GRU/LSTM hidden size, depth, head MLP sizes, LR,
-  seasonal features, and attention (on/off, attn_dim).
-- Uses MLflow tags (run_key) to detect whether a configuration has already
-  finished; if so, that combo is skipped (useful for resuming after failure).
+Everything else fixed to a baseline config.
+Uses MLflow run_key to skip completed configs.
 """
 
 import itertools
 import os
 import subprocess
-from typing import List
+from typing import List, Optional
 
-import mlflow
 from mlflow.tracking import MlflowClient
 
 
 # -----------------------------
-# Configurable sweep grids
+# Config
 # -----------------------------
-
-EXPERIMENT_NAME = "Emulator Sweep"  # change if you like
-
+EXPERIMENT_NAME = "Smooth Weather Sweep"
 TRAIN_SCRIPT = "train.py"
 
-# Window sizes
-WX_LIST = [360]
-WY_LIST = [30]  
+# Fixed baseline config (edit these to your preferred defaults)
+WX = 365
+WY = 30
 
-# RNN hyperparameters
-HIDDEN_LIST = [16, 32, 64, 128, 256]     # hidden size
-NUM_LAYERS_LIST = [1, 2, 3]         # RNN depth
+HIDDEN = 16
+NUM_LAYERS = 1
+HEAD_HIDDEN = "64, 64"
+LR = 7e-4
 
-# MLP head depths: strings must match train.py --head_hidden
-HEAD_HIDDEN_LIST: List[str] = [
-    "16",
-    "32"
-    "64",
-    "128",
-    "256",
-    "16, 16",
-    "32, 32",
-    "64, 64",
-    "128, 128",
-    "256, 256"
+EPOCHS = 12
+BATCH_SIZE = 512
+
+DEVICE = "cuda"  # set to "cuda" / "cpu" to force, or leave None
+
+
+# -----------------------------
+# Sweep grids
+# -----------------------------
+
+# Smooth window configurations:
+# - None means: do not pass --smooth_windows (no smoothing features)
+# - otherwise a list like [7, 30] -> pass --smooth_windows "7,30"
+SMOOTH_WINDOWS_GRID: List[Optional[List[int]]] = [
+    None,
+    [7],
+    [30],
+    [7, 30],
 ]
 
-# Learning rates
-LR_LIST = [2.5e-3]
+SMOOTH_PAD_MODE = "reflect"  # passed to train.py
 
-# Seasonal feature flag: 0 = off, 1 = on
-USE_SEASONAL_LIST = [0, 1]
+RNN_DROPOUT_LIST = [0.0]
+HEAD_DROPOUT_LIST = [0.0]
 
-# Attention flags / dims
-USE_ATTENTION_LIST = [0]           # 0 = off, 1 = on
-ATTN_DIM_LIST = [32]              # only relevant if use_attention=1
-
-# Base training args shared across sweep
-BASE_EPOCHS = 5
-BASE_BATCH_SIZE = 512
-BASE_SMOOTH_LAMBDA = 0.0
-BASE_RNN_DROPOUT = 0.0
-BASE_HEAD_DROPOUT = 0.0
-
-# Fixed cell type for now (can make a list if you want to compare GRU vs LSTM)
-CELL = "gru"
+# NEW: smoothness penalty strength
+SMOOTH_LAMBDA_LIST = [0.0]   # tweak to taste
 
 
 # -----------------------------
 # MLflow helpers
 # -----------------------------
-
 def get_or_create_experiment(experiment_name: str) -> str:
-    """
-    Return the experiment_id for the given experiment name,
-    creating it if it does not exist.
-    """
     client = MlflowClient()
     exp = client.get_experiment_by_name(experiment_name)
     if exp is None:
@@ -89,34 +77,28 @@ def get_or_create_experiment(experiment_name: str) -> str:
     return exp_id
 
 
-def config_run_key(
-    cell: str,
+def make_run_key(
     Wx: int,
     Wy: int,
-    hidden: int,
-    num_layers: int,
-    lr: float,
-    head_hidden: str,
-    use_seasonal: int,
-    use_attention: int,
-    attn_dim: int,
+    smooth_windows: Optional[List[int]],
+    smooth_pad_mode: str,
+    rnn_dropout: float,
+    head_dropout: float,
+    smooth_lambda: float,
 ) -> str:
     """
-    Must match the run_key format used in train.py.
+    A stable run_key for deduplication/resume. Keep this consistent.
     """
+    sw = "none" if smooth_windows is None else ",".join(map(str, smooth_windows))
     return (
-        f"rnn_cell{cell}_Wx{Wx}_Wy{Wy}_"
-        f"H{hidden}_L{num_layers}_LR{lr}_head{head_hidden}_"
-        f"seasonal{use_seasonal}_"
-        f"attn{use_attention}_attnDim{attn_dim}"
+        f"gru_Wx{Wx}_Wy{Wy}_"
+        f"sw{sw}_pad{smooth_pad_mode}_"
+        f"rnnDrop{rnn_dropout}_headDrop{head_dropout}_"
+        f"smoothLam{smooth_lambda}"
     )
 
 
 def is_config_finished(exp_id: str, run_key: str) -> bool:
-    """
-    Check MLflow for any FINISHED run with the given run_key tag in experiment exp_id.
-    If found, we treat that configuration as completed.
-    """
     client = MlflowClient()
     filter_str = f"tags.run_key = '{run_key}'"
     runs = client.search_runs(
@@ -126,8 +108,7 @@ def is_config_finished(exp_id: str, run_key: str) -> bool:
         order_by=["attributes.start_time DESC"],
     )
     for r in runs:
-        status = r.info.status
-        if status == "FINISHED":
+        if r.info.status == "FINISHED":
             return True
     return False
 
@@ -135,114 +116,91 @@ def is_config_finished(exp_id: str, run_key: str) -> bool:
 # -----------------------------
 # Main sweep
 # -----------------------------
-
 def main():
-    # Ensure MLflow experiment exists
     exp_id = get_or_create_experiment(EXPERIMENT_NAME)
     print(f"Using MLflow experiment '{EXPERIMENT_NAME}' (id={exp_id})")
 
-    # Parent directory for artifacts for the sweep
     os.makedirs("sweep_artifacts", exist_ok=True)
 
-    # Cartesian product over hyperparameters
     combo_iter = itertools.product(
-        WX_LIST,
-        WY_LIST,
-        HIDDEN_LIST,
-        NUM_LAYERS_LIST,
-        HEAD_HIDDEN_LIST,
-        LR_LIST,
-        USE_SEASONAL_LIST,
-        USE_ATTENTION_LIST,
-        ATTN_DIM_LIST,
+        SMOOTH_WINDOWS_GRID,
+        RNN_DROPOUT_LIST,
+        HEAD_DROPOUT_LIST,
+        SMOOTH_LAMBDA_LIST,
     )
 
-    for (
-        Wx,
-        Wy,
-        hidden,
-        num_layers,
-        head_hidden,
-        lr,
-        use_seasonal,
-        use_attention,
-        attn_dim,
-    ) in combo_iter:
-
-        # Optionally skip attention dims when attention is off
-        if use_attention == 0 and attn_dim != ATTN_DIM_LIST[0]:
-            # To avoid redundant configs when attention is off,
-            # only keep the first attn_dim value in that case.
-            continue
-
-        run_key = config_run_key(
-            cell=CELL,
-            Wx=Wx,
-            Wy=Wy,
-            hidden=hidden,
-            num_layers=num_layers,
-            lr=lr,
-            head_hidden=head_hidden,
-            use_seasonal=use_seasonal,
-            use_attention=use_attention,
-            attn_dim=attn_dim,
+    for smooth_windows, rnn_dropout, head_dropout, smooth_lambda in combo_iter:
+        run_key = make_run_key(
+            Wx=WX,
+            Wy=WY,
+            smooth_windows=smooth_windows,
+            smooth_pad_mode=SMOOTH_PAD_MODE,
+            rnn_dropout=rnn_dropout,
+            head_dropout=head_dropout,
+            smooth_lambda=smooth_lambda,
         )
 
-        # Check if this configuration already has a FINISHED run
         if is_config_finished(exp_id, run_key):
-            print(f"[SKIP] run_key={run_key} already has a FINISHED run.")
+            print(f"[SKIP] run_key={run_key} already FINISHED.")
             continue
 
-        # Build a unique artifacts directory for this config
-        head_tag = head_hidden.replace(",", "-")
-        season_tag = f"seasonal{use_seasonal}"
-        attn_tag = f"attn{use_attention}_attnDim{attn_dim}"
+        # artifacts dir
+        sw_tag = "none" if smooth_windows is None else "-".join(map(str, smooth_windows))
         artifacts_dir = os.path.join(
             "sweep_artifacts",
-            f"rnn_cell{CELL}_Wx{Wx}_Wy{Wy}_H{hidden}_L{num_layers}_"
-            f"head{head_tag}_lr{lr}_{season_tag}_{attn_tag}"
+            f"gru_Wx{WX}_Wy{WY}_sw{sw_tag}_pad{SMOOTH_PAD_MODE}_"
+            f"rnnDrop{rnn_dropout}_headDrop{head_dropout}_smoothLam{smooth_lambda}"
         )
         os.makedirs(artifacts_dir, exist_ok=True)
 
-        # Construct command line for train.py
+        # command
         cmd = [
             "python", TRAIN_SCRIPT,
-            f"--Wx={Wx}",
-            f"--Wy={Wy}",
-            f"--hidden={hidden}",
-            f"--num_layers={num_layers}",
-            f"--head_hidden={head_hidden}",
-            f"--lr={lr}",
-            f"--epochs={BASE_EPOCHS}",
-            f"--batch_size={BASE_BATCH_SIZE}",
-            f"--smooth_lambda={BASE_SMOOTH_LAMBDA}",
-            f"--rnn_dropout={BASE_RNN_DROPOUT}",
-            f"--head_dropout={BASE_HEAD_DROPOUT}",
-            f"--cell={CELL}",
+            f"--Wx={WX}",
+            f"--Wy={WY}",
+            f"--hidden={HIDDEN}",
+            f"--num_layers={NUM_LAYERS}",
+            f"--head_hidden={HEAD_HIDDEN}",
+            f"--lr={LR}",
+            f"--epochs={EPOCHS}",
+            f"--batch_size={BATCH_SIZE}",
+            f"--smooth_lambda={smooth_lambda}",
+            f"--rnn_dropout={rnn_dropout}",
+            f"--head_dropout={head_dropout}",
             f"--artifacts={artifacts_dir}",
             f"--experiment={EXPERIMENT_NAME}",
-            f"--attn_dim={attn_dim}",
+            f"--smooth_pad_mode={SMOOTH_PAD_MODE}",
         ]
 
-        if use_seasonal:
-            cmd.append("--use_seasonal_features")
-        if use_attention:
-            cmd.append("--use_attention")
+        # only pass smooth_windows if enabled
+        if smooth_windows is not None and len(smooth_windows) > 0:
+            cmd.append(f"--smooth_windows={','.join(map(str, smooth_windows))}")
+
+        # optional device override
+        if DEVICE is not None:
+            cmd.append(f"--device={DEVICE}")
+
+        # pass run_key via environment; train.py should do:
+        #   rk = os.getenv("RUN_KEY","");  if rk: mlflow.set_tag("run_key", rk)
+        env = os.environ.copy()
+        env["RUN_KEY"] = run_key
 
         print("\n========================================")
         print("Running config:")
-        print(f"  Wx={Wx}, Wy={Wy}, hidden={hidden}, num_layers={num_layers},")
-        print(f"  head_hidden={head_hidden}, lr={lr}, "
-              f"use_seasonal={use_seasonal}, use_attention={use_attention}, attn_dim={attn_dim}")
+        print(f"  smooth_windows={smooth_windows}, pad_mode={SMOOTH_PAD_MODE}")
+        print(f"  rnn_dropout={rnn_dropout}, head_dropout={head_dropout}")
+        print(f"  smooth_lambda={smooth_lambda}")
         print("run_key:", run_key)
         print("artifacts:", artifacts_dir)
         print("Command:", " ".join(cmd))
         print("========================================\n")
 
         try:
-            subprocess.run(cmd, check=True)
+            subprocess.run(cmd, check=True, env=env)
         except subprocess.CalledProcessError as e:
-            print(f"[ERROR] Training failed for run_key={run_key} with return code {e.returncode}")
+            print(f"[ERROR] Training failed for run_key={run_key} (return code={e.returncode})")
+
+    print("Sweep complete.")
 
 
 if __name__ == "__main__":

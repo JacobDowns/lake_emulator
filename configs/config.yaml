@@ -1,0 +1,7 @@
+defaults:
+  - data: base
+  - model: gru
+  - train: base
+  - mlflow: base
+  - sweeps: null   # <-- add this
+  - _self_

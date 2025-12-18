@@ -1,13 +1,15 @@
 from torch.utils.data import Dataset
 import numpy as np
 import torch
+import matplotlib.pyplot as plt
+import pandas as pd
 
 
 # =========================================================
 # Dataset: windowing over arrays returned by load_data
 # =========================================================
 class LakeWindowDataset(Dataset):
-    """2
+    """
     Given:
       weather: (T, Du)
       outputs: (N, T, Dz)
@@ -33,7 +35,8 @@ class LakeWindowDataset(Dataset):
         W_y: int = 1,
         trial_ids=None,
         extra_features: np.ndarray | None = None,
-        return_ids: bool = False,
+        return_ids: bool = False
+
     ):
         super().__init__()
         self.return_ids = return_ids
@@ -99,38 +102,92 @@ class LakeWindowDataset(Dataset):
         else:
             return x_win, p_vec, y
     
+import numpy as np
 
-# =========================================================
-# Data loading (train-only normalization; strip YEAR, keep DOY)
-# =========================================================
+def smooth_weather_timeseries(
+    weather: np.ndarray,
+    window_days: list[int],
+    pad_mode: str = "reflect",   # "reflect" | "edge" | "wrap"
+) -> dict[str, np.ndarray]:
+    """
+    Moving-average smooths of weather drivers across multiple window sizes
+    with explicit padding (avoids np.convolve(mode="same") zero-padding artifacts).
+    Returns arrays of same length T.
+
+    weather: (T, Du)
+    """
+    if weather.ndim != 2:
+        raise ValueError(f"weather must be 2D (T, Du); got shape {weather.shape}")
+
+    if pad_mode not in ("reflect", "edge", "wrap"):
+        raise ValueError(f"pad_mode must be one of 'reflect', 'edge', 'wrap'; got {pad_mode}")
+
+    T, Du = weather.shape
+    out: dict[str, np.ndarray] = {}
+
+    for w in window_days:
+        if not isinstance(w, (int, np.integer)) or w <= 0:
+            raise ValueError(f"window sizes must be positive ints; got {w}")
+
+        if w == 1:
+            out[f"weather_smoothed_{w}"] = weather.astype(np.float32, copy=False)
+            continue
+
+        left = w // 2
+        right = w - 1 - left  # left+right = w-1 ensures output length T with 'valid'
+
+        padded = np.pad(weather, ((left, right), (0, 0)), mode=pad_mode)
+        kernel = np.ones(w, dtype=np.float32) / float(w)
+
+        sm = np.empty((T, Du), dtype=np.float32)
+        for j in range(Du):
+            sm[:, j] = np.convolve(padded[:, j], kernel, mode="valid").astype(np.float32)
+
+        out[f"weather_smoothed_{w}"] = sm
+
+    return out
+
+
 def load_data(
     weather_path='data/parsed_data/weather_data.npy',
     output_path ='data/parsed_data/output_data.npy',
     params_path ='data/parsed_data/parameter_data.npy',
+    bathymetry_path='data/BearLake_inputs_outputs/inputs/BearLake_bathy.csv',
     split_years = [2018, 2020, 2025],  # [train_end, val_end, max]
-    normalize = True
+    normalize = True,
+    smooth_windows: list[int] | None = None,   # e.g. [7, 30]
+    smooth_pad_mode: str = "reflect",
 ):
     """
     Returns dict of splits with train-only normalization applied:
-      weather_data_* : (T_split, Du)  # YEAR/DOY removed
+      weather_data_* : (T_split, Du_total)  # YEAR/DOY removed; drivers + optional smooths
       output_data_*  : (N, T_split, Dz)
-      doy_*          : (T_split,)       # day-of-year retained for features
+      doy_*          : (T_split,)
       params_data    : (N, P)
       norms          : dict with means/stds for inverse-transform
-
-    YEAR used only for splitting.
-    DOY is *not* included in weather_* but is returned separately so
-    you can build seasonal features (e.g. sin/cos(doy)) if desired.
     """
-    weather = np.load(weather_path)   # (T, 2 + Du) : [YEAR, DOY, drivers...]
+    weather = np.load(weather_path)   # (T, 2 + Du_raw): [YEAR, DOY, drivers...]
     outputs = np.load(output_path)    # (N, T, Dz)
     params  = np.load(params_path)    # (N, P)
+    bathymetry = pd.read_csv(bathymetry_path)['area_ha'].to_numpy() / 100.0
 
     year = weather[:, 0]
     doy  = weather[:, 1].astype(np.float32)
-    drivers = weather[:, 2:]          # (T, Du)
+    drivers = weather[:, 2:].astype(np.float32)  # (T, Du_raw)
 
-    # splits
+    # ---- optional smoothing (append features) ----
+    if smooth_windows is None:
+        smooth_windows = []
+    # allow arbitrary list; remove duplicates while keeping order
+    seen = set()
+    smooth_windows = [int(w) for w in smooth_windows if int(w) not in seen and not seen.add(int(w))]
+
+    if len(smooth_windows) > 0:
+        smooth_dict = smooth_weather_timeseries(drivers, smooth_windows, pad_mode=smooth_pad_mode)
+        smooth_feats = [smooth_dict[f"weather_smoothed_{w}"] for w in smooth_windows]  # each (T, Du_raw)
+        drivers = np.concatenate([drivers] + smooth_feats, axis=1)  # (T, Du_raw*(1+len(windows)))
+
+    # ---- splits ----
     idx_train = (year <= split_years[0])
     idx_val   = (year > split_years[0]) & (year <= split_years[1])
     idx_test  = (year > split_years[1])
@@ -139,24 +196,27 @@ def load_data(
     weather_val   = drivers[idx_val, :]
     weather_test  = drivers[idx_test, :]
 
-    outputs_train = outputs[:, idx_train, :]
-    outputs_val   = outputs[:, idx_val, :]
-    outputs_test  = outputs[:, idx_test, :]
+    outputs_train = outputs[:, idx_train, :].astype(np.float32)
+    outputs_val   = outputs[:, idx_val, :].astype(np.float32)
+    outputs_test  = outputs[:, idx_test, :].astype(np.float32)
 
     doy_train = doy[idx_train]
     doy_val   = doy[idx_val]
     doy_test  = doy[idx_test]
 
+    params = params.astype(np.float32)
+
+    # ---- normalization (train-only) ----
     if normalize:
         eps = 1e-6
-        w_mean = weather_train.mean(axis=0, keepdims=True)         # (1, Du)
-        w_std  = weather_train.std(axis=0, keepdims=True) + eps    # (1, Du)
+        w_mean = weather_train.mean(axis=0, keepdims=True)               # (1, Du_total)
+        w_std  = weather_train.std(axis=0, keepdims=True) + eps          # (1, Du_total)
 
-        o_mean = outputs_train.mean(axis=(0,1), keepdims=True)     # (1, 1, Dz)
-        o_std  = outputs_train.std(axis=(0,1), keepdims=True) + eps# (1, 1, Dz)
+        o_mean = outputs_train.mean(axis=(0, 1), keepdims=True)          # (1, 1, Dz)
+        o_std  = outputs_train.std(axis=(0, 1), keepdims=True) + eps     # (1, 1, Dz)
 
-        p_mean = params.mean(axis=0, keepdims=True)                # (1, P)
-        p_std  = params.std(axis=0, keepdims=True) + eps           # (1, P)
+        p_mean = params.mean(axis=0, keepdims=True)                      # (1, P)
+        p_std  = params.std(axis=0, keepdims=True) + eps                 # (1, P)
 
         weather_train = (weather_train - w_mean) / w_std
         weather_val   = (weather_val   - w_mean) / w_std
@@ -169,12 +229,14 @@ def load_data(
         params = (params - p_mean) / p_std
 
         norms = {
-            "weather_mean": w_mean.astype(np.float32),   # (1, Du)
-            "weather_std":  w_std.astype(np.float32),    # (1, Du)
-            "output_mean":  o_mean.astype(np.float32),   # (1, 1, Dz)
-            "output_std":   o_std.astype(np.float32),    # (1, 1, Dz)
-            "params_mean":  p_mean.astype(np.float32),   # (1, P)
-            "params_std":   p_std.astype(np.float32),    # (1, P)
+            "weather_mean": w_mean.astype(np.float32),
+            "weather_std":  w_std.astype(np.float32),
+            "output_mean":  o_mean.astype(np.float32),
+            "output_std":   o_std.astype(np.float32),
+            "params_mean":  p_mean.astype(np.float32),
+            "params_std":   p_std.astype(np.float32),
+            "smooth_windows": np.array(smooth_windows, dtype=np.int32),
+            "smooth_pad_mode": smooth_pad_mode,
         }
     else:
         norms = None
@@ -190,21 +252,9 @@ def load_data(
         "doy_val":            doy_val.astype(np.float32),
         "doy_test":           doy_test.astype(np.float32),
         "params_data":        params.astype(np.float32),
-        "norms":              norms
+        "norms":              norms,
+        "bathymetry":         bathymetry.astype(np.float32),
     }
 
 
-# =========================================================
-# Extra feature builders (seasonality etc.)
-# =========================================================
-def build_seasonal_features(doy: np.ndarray) -> np.ndarray:
-    """
-    Build a cyclic encoding of day-of-year.
-    doy: (T,) with values in [1,365] or [0,364]
-    Returns: (T, 2) array with sin/cos(2π * doy / 365).
-    """
-    angle = 2.0 * np.pi * (doy / 365.0)
-    sin_doy = np.sin(angle)
-    cos_doy = np.cos(angle)
-    return np.stack([sin_doy, cos_doy], axis=-1).astype(np.float32)  # (T, 2)
-
+load_data()

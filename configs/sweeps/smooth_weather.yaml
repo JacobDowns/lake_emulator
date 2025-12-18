@@ -1,0 +1,17 @@
+# configs/sweeps/smooth_weather.yaml
+
+mlflow:
+  experiment: "Smooth Weather Sweep"
+
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    params:
+      # sweep feature inputs
+      data.smooth_windows: "[],[7],[30],[7,30]"
+      data.smooth_pad_mode: "reflect"
+
+      # sweep regularization / dropouts
+      train.rnn_dropout: "0.0,0.1,0.2"
+      train.head_dropout: "0.0,0.1,0.2"
+      train.smooth_lambda: "0.0,1e-4,1e-3"

@@ -40,7 +40,7 @@ def build_mlp(
 class _SqueezeSingleStepMixin:
     """
     If W_y == 1 and squeeze_output=True, convert (B, 1, Dz) -> (B, Dz)
-    so the rest of the code can always expect (B, Dz) for single-step.
+    so the rest of the code can always expect (B, Dz) for single-step. 
     """
     def _maybe_squeeze(self, y: torch.Tensor, W_y: int, squeeze_output: bool) -> torch.Tensor:
         if squeeze_output and y.dim() == 3 and W_y == 1:
@@ -64,7 +64,7 @@ class ModelMLP(nn.Module, _SqueezeSingleStepMixin):
         Du: int,
         P: int,
         Dz: int,
-        W_y: int = 1,
+        W_y: int = 30,
         mlp_hidden: Union[int, Iterable[int]] = (256, 256),
         mlp_dropout: float = 0.0,
         activation: nn.Module = nn.ReLU,
@@ -121,70 +121,32 @@ class ModelRNN(nn.Module, _SqueezeSingleStepMixin):
         Dz: int = 8,
         hidden: int = 128,
         num_layers: int = 3,
-        rnn_dropout: float = 0.0,
-        W_y: int = 1,
+        rnn_dropout: float = 0.1,
+        W_y: int = 30,
         head_hidden: Union[int, Iterable[int]] = 128,
-        head_dropout: float = 0.0,
+        head_dropout: float = 0.1,
         activation: nn.Module = nn.ReLU,
         squeeze_output: bool = True,
         param_in_rnn: bool = True,
         param_in_head: bool = True,
-        # NEW:
-        use_attention: bool = True,
-        attn_dim: int = 64,
     ):
         super().__init__()
         self.param_in_rnn = param_in_rnn
         self.param_in_head = param_in_head
         self.W_y, self.Dz, self.P = W_y, Dz, P
         self.squeeze_output = squeeze_output
-        self.use_attention = use_attention
 
         # RNN input dimension
         rnn_input_dim = Du + (P if param_in_rnn else 0)
 
-        cell = cell.lower()
-        if cell == "gru":
-            self.rnn = nn.GRU(
-                rnn_input_dim,
-                hidden,
-                num_layers=num_layers,
-                batch_first=True,
-                dropout=rnn_dropout if num_layers > 1 else 0.0,
-            )
-        elif cell == "lstm":
-            self.rnn = nn.LSTM(
-                rnn_input_dim,
-                hidden,
-                num_layers=num_layers,
-                batch_first=True,
-                dropout=rnn_dropout if num_layers > 1 else 0.0,
-            )
-        elif cell == "rnn":
-            self.rnn = nn.RNN(
-                rnn_input_dim,
-                hidden,
-                nonlinearity="tanh",
-                num_layers=num_layers,
-                batch_first=True,
-                dropout=rnn_dropout if num_layers > 1 else 0.0,
-            )
-        else:
-            raise ValueError("cell must be 'gru', 'lstm', or 'rnn'")
-
-        # Optional temporal attention (parameter-conditioned)
-        if self.use_attention:
-            # h_t -> A
-            self.attn_W = nn.Linear(hidden, attn_dim, bias=True)
-            # p_vec -> A
-            self.attn_P = nn.Linear(P, attn_dim, bias=False)
-            # A -> scalar score
-            self.attn_v = nn.Linear(attn_dim, 1, bias=False)
-        else:
-            self.attn_W = None
-            self.attn_P = None
-            self.attn_v = None
-
+        self.rnn = nn.GRU(
+            rnn_input_dim,
+            hidden,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=rnn_dropout if num_layers > 1 else 0.0,
+        )
+            
         # MLP head: maps [hidden (+params)] -> Dz per step
         head_in_dim = hidden + (P if param_in_head else 0)
         self.head = build_mlp(
@@ -194,26 +156,6 @@ class ModelRNN(nn.Module, _SqueezeSingleStepMixin):
             activation=activation,
             dropout=head_dropout,
         )
-
-    def _apply_attention(self, out: torch.Tensor, p_vec: torch.Tensor) -> torch.Tensor:
-        """
-        out:   (B, W_x, H) hidden states
-        p_vec: (B, P)
-
-        Returns:
-          context: (B, H) attention-pooled vector.
-        """
-        # Project hidden states
-        Wh = self.attn_W(out)                             # (B, W_x, A)
-        # Project params and broadcast over time
-        Wp = self.attn_P(p_vec).unsqueeze(1)              # (B, 1, A)
-        s = torch.tanh(Wh + Wp)                           # (B, W_x, A)
-        scores = self.attn_v(s).squeeze(-1)               # (B, W_x)
-        alpha = torch.softmax(scores, dim=1)              # (B, W_x)
-        # Weighted sum of hidden states
-        context = torch.bmm(alpha.unsqueeze(1), out)      # (B, 1, H)
-        context = context.squeeze(1)                      # (B, H)
-        return context
 
     def forward(self, x_win: torch.Tensor, p_vec: torch.Tensor) -> torch.Tensor:
         # x_win: (B, W_x, Du), p_vec: (B, P)
@@ -226,14 +168,8 @@ class ModelRNN(nn.Module, _SqueezeSingleStepMixin):
 
         out, _ = self.rnn(x_in)           # (B, W_x, H)
 
-        if self.use_attention:
-            # Parameter-conditioned attention over ALL W_x steps
-            context = self._apply_attention(out, p_vec)          # (B, H)
-            # Reuse the same context for each of the W_y steps (works great for Wy=1)
-            last_seq = context.unsqueeze(1).expand(-1, self.W_y, -1)  # (B, W_y, H)
-        else:
-            # Original behavior: take the last W_y hidden states
-            last_seq = out[:, -self.W_y:, :]  # (B, W_y, H)
+        #Take the last W_y hidden states
+        last_seq = out[:, -self.W_y:, :]  # (B, W_y, H)
 
         if self.param_in_head:
             p_rep_head = p_vec.unsqueeze(1).expand(-1, self.W_y, -1)  # (B, W_y, P)

@@ -1,0 +1,9 @@
+epochs: 15
+batch_size: 512
+lr: 7e-4
+smooth_lambda: 0.0
+seed: 42
+
+device: cuda
+artifacts: artifacts_run
+log_model_every_improvement: true
