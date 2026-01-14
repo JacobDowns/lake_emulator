@@ -272,7 +272,7 @@ def main():
 
     # logging / artifacts
     ap.add_argument("--artifacts", type=str, default="artifacts_run")
-    ap.add_argument("--experiment", type=str, default="test3")
+    ap.add_argument("--experiment", type=str, default="test")
     ap.add_argument("--log_debug_plot", type=int, default=1)
 
     args = ap.parse_args()
