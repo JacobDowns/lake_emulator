@@ -2,487 +2,895 @@
 """
 compare_with_observations.py
 
-Compare simulator outputs and emulator predictions to in-situ observations.
+Load a trained emulator from an MLflow `run_id`, load a lake's in-situ temperature
+observations, align observation timestamps to the emulator's `(YEAR, DOY)` time axis,
+and compare:
+  - simulator (precomputed) vs observations
+  - emulator predictions vs observations
 
-Produces:
- - per-simulation RMSE (sim vs obs)
- - per-simulation RMSE (emulator vs obs)
- - Plots per-lake histograms and scatter comparisons.
+Observations are expected at:
+  `data/original_data/{lake}/observations/{lake}-temperature-obs.csv`
 
-Usage example:
-  python compare_with_observations.py \
-    --ckpt <path_or_mlflow_run_id> \
-    --root_dir data/parsed_data \
-    --lakes BearLake RedPond \
-    --obs_dir data/observations \
-    --outdir outputs_compare
-
-If ckpt is an MLflow run id (e.g. "7b835f..."), the script will attempt to download
-artifacts/run/checkpoints/best.pt via MLflow client. Otherwise it will treat the
-argument as a local filepath to a checkpoint.
+This script is intentionally structured like `eval_multilake_summary.py` and can be
+extended later with richer plots/diagnostics.
 """
+
 from __future__ import annotations
-import os
+
 import argparse
-import json
-from typing import Dict, List, Optional, Tuple
-import math
+import csv
+import datetime as dt
+import os
+import random
+from dataclasses import dataclass
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
-import pandas as pd
 import torch
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 
-# Local project modules (assumes these are importable in PYTHONPATH)
-from multi_lake_dataset import load_multi_lake_data, LakeData
+from multi_lake_dataset import LakeData, load_multi_lake_data
 from emulator_utils import (
     build_model_from_ckpt_config,
     denorm_outputs,
-    load_checkpoint,
+    load_checkpoint_from_mlflow,
     predict_timeseries_for_sim_batched,
     split_time_indices,
 )
 
 
-# ---------------------
-# Utilities
-# ---------------------
-def parse_obs_csv(path: str) -> pd.DataFrame:
-    """
-    Expect CSV with columns: datetime, depth, temperature [, instrument ...]
-    datetime may be YYYYMMDD or YYYY-MM-DD; result will include YEAR and DOY columns.
-    """
-    df = pd.read_csv(path)
-    if "datetime" not in df.columns:
-        raise ValueError(f"Observations file {path} missing 'datetime' column")
+# =========================================================
+# Observations: parsing + alignment
+# =========================================================
 
-    # try several datetime formats
-    def parse_dt(s):
-        s = str(s)
-        if "-" in s:
+@dataclass(frozen=True)
+class Observations:
+    year: np.ndarray        # (M,) int
+    doy: np.ndarray         # (M,) float (may be fractional)
+    doy_key: np.ndarray     # (M,) int (used for alignment to daily model axis by default)
+    depth: np.ndarray       # (M,) float
+    temp: np.ndarray        # (M,) float
+
+
+def _parse_obs_datetime(s: str) -> dt.datetime:
+    s = str(s).strip()
+    if not s:
+        raise ValueError("empty datetime")
+
+    # Common compact encodings: YYYYMMDD, YYYYMMDDHHMM, YYYYMMDDHHMMSS
+    if s.isdigit():
+        if len(s) == 8:
+            return dt.datetime.strptime(s, "%Y%m%d")
+        if len(s) == 12:
+            return dt.datetime.strptime(s, "%Y%m%d%H%M")
+        if len(s) == 14:
+            return dt.datetime.strptime(s, "%Y%m%d%H%M%S")
+
+    # Try ISO-ish variants (including with time)
+    for fmt in (
+        "%Y-%m-%d",
+        "%Y/%m/%d",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y/%m/%d %H:%M",
+        "%Y/%m/%d %H:%M:%S",
+        "%m/%d/%Y",
+        "%m/%d/%Y %H:%M",
+        "%m/%d/%Y %H:%M:%S",
+    ):
+        try:
+            return dt.datetime.strptime(s, fmt)
+        except ValueError:
+            pass
+
+    # Last resort: datetime.fromisoformat (handles "YYYY-MM-DDTHH:MM:SS")
+    try:
+        return dt.datetime.fromisoformat(s.replace("Z", ""))
+    except ValueError as e:
+        raise ValueError(f"unrecognized datetime format: {s!r}") from e
+
+
+def load_observations_csv(path: str) -> Observations:
+    with open(path, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        required = {"datetime", "depth", "temperature"}
+        missing = required - set(reader.fieldnames or [])
+        if missing:
+            raise ValueError(f"{path} missing required columns: {sorted(missing)}")
+
+        n_skipped_missing = 0
+        n_skipped_parse = 0
+
+        years: List[int] = []
+        doys: List[float] = []
+        doy_keys: List[int] = []
+        depths: List[float] = []
+        temps: List[float] = []
+
+        for row in reader:
+            dt_raw = (row.get("datetime", "") or "").strip()
+            depth_raw = (row.get("depth", "") or "").strip()
+            temp_raw = (row.get("temperature", "") or "").strip()
+
+            if (not dt_raw) or (not depth_raw) or (not temp_raw):
+                n_skipped_missing += 1
+                continue
+
             try:
-                return pd.to_datetime(s, format="%Y-%m-%d")
+                dtt = _parse_obs_datetime(dt_raw)
+                depth = float(depth_raw)
+                temp = float(temp_raw)
             except Exception:
-                return pd.to_datetime(s, errors="coerce")
-        else:
-            # maybe YYYYMMDD
-            try:
-                return pd.to_datetime(s, format="%Y%m%d")
-            except Exception:
-                return pd.to_datetime(s, errors="coerce")
+                n_skipped_parse += 1
+                continue
 
-    df["dt_parsed"] = df["datetime"].apply(parse_dt)
-    if df["dt_parsed"].isna().any():
-        raise ValueError(f"Unable to parse some datetimes in {path}")
+            doy_int = int(dtt.timetuple().tm_yday)
+            frac = (dtt.hour * 3600 + dtt.minute * 60 + dtt.second) / 86400.0
+            doy_float = float(doy_int) + float(frac)
 
-    df["YEAR"] = df["dt_parsed"].dt.year.astype(int)
-    df["DOY"] = df["dt_parsed"].dt.dayofyear.astype(int)
-    # Ensure columns exist
-    if "depth" not in df.columns or "temperature" not in df.columns:
-        raise ValueError(f"Observations file {path} must have 'depth' and 'temperature' columns")
+            years.append(int(dtt.year))
+            doys.append(doy_float)
+            doy_keys.append(doy_int)
+            depths.append(depth)
+            temps.append(temp)
 
-    df["depth"] = df["depth"].astype(float)
-    df["temperature"] = df["temperature"].astype(float)
+    if n_skipped_missing or n_skipped_parse:
+        print(
+            f"[obs] skipped rows in {path}: missing_required_fields={n_skipped_missing}, parse_errors={n_skipped_parse}"
+        )
 
-    return df
-
-
-def interp_profile_clamped(profile: np.ndarray, depth_grid: np.ndarray, z: float) -> float:
-    """
-    Interpolate a 1D profile (depth_grid ascending order) to depth z.
-    Uses np.interp which clamps (returns edge value) for out-of-range z.
-    profile: (Dz,)
-    depth_grid: (Dz,) numeric depths
-    z: scalar depth
-    """
-    # np.interp expects xp increasing; assume depth_grid is increasing (shallow->deep).
-    return float(np.interp(z, depth_grid, profile))
-
-
-# ------------------------
-# Prediction helper (batched)
-# ------------------------
-@torch.no_grad()
-def predict_split_for_sim(
-    model: torch.nn.Module,
-    lake: LakeData,
-    sim_id: int,
-    depth_feat_padded: np.ndarray,
-    depth_mask: np.ndarray,
-    split: str,
-    split_years: Tuple[int, int, int],
-    Wx: int,
-    Wy: int,
-    stride: int = 1,
-    device: str = "cpu",
-    batch_windows: int = 128,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Returns:
-      - truth: (T_split, Dz_lake) normalized
-      - pred:  (T_split, Dz_max) normalized (NaN where no pred)
-      - depth_mask: (Dz_max,)
-    """
-    t_idx = split_time_indices(lake.year, split, split_years)
-
-    drivers = lake.drivers[t_idx, :]  # (T_split, Du)
-    temps = lake.temps[sim_id, t_idx, :]  # (T_split, Dz_lake)
-    T_split = drivers.shape[0]
-    Dz_lake = temps.shape[1]
-    Dzmax = depth_feat_padded.shape[0]
-
-    if T_split < Wx:
-        # no windows -> truth still returned, preds all NaN
-        truth = np.zeros((T_split, Dz_lake), dtype=np.float32)
-        truth[:, :] = temps.astype(np.float32, copy=False)
-        pred = np.full((T_split, Dzmax), np.nan, dtype=np.float32)
-        return truth, pred, depth_mask.astype(np.float32)
-
-    pred = predict_timeseries_for_sim_batched(
-        model=model,
-        drivers=drivers,
-        p_vec=lake.params[sim_id],
-        depth_feat_padded=depth_feat_padded,
-        Wx=Wx,
-        Wy=Wy,
-        stride=max(1, int(stride)),
-        device=device,
-        batch_windows=max(1, int(batch_windows)),
+    return Observations(
+        year=np.asarray(years, dtype=np.int32),
+        doy=np.asarray(doys, dtype=np.float32),
+        doy_key=np.asarray(doy_keys, dtype=np.int32),
+        depth=np.asarray(depths, dtype=np.float32),
+        temp=np.asarray(temps, dtype=np.float32),
     )
 
-    truth = temps.astype(np.float32, copy=False)
-    return truth, pred, depth_mask.astype(np.float32)
 
-
-# ------------------------
-# RMSE computation aligning obs -> model days/depths
-# ------------------------
-def compute_rmse_for_obs(
-    obs_df: pd.DataFrame,
-    lake: LakeData,
-    sim_truth: np.ndarray,
-    sim_pred: np.ndarray,
-    depth_grid: np.ndarray,
-    split: str,
-    split_years: Tuple[int, int, int],
-) -> Tuple[float, int]:
-    """
-    For a single lake and a single simulation:
-      - obs_df has YEAR, DOY, depth, temperature columns
-      - sim_truth: (T_split, Dz_lake) in physical units (denormed by caller if desired)
-      - sim_pred:  (T_split, Dz_lake) in physical units (denormed), may have NaNs
-      - depth_grid: (Dz_lake,) numeric depths
-    Returns RMSE computed on aligned observation rows (skips obs without matching day or with missing pred).
-    """
-
-    # select obs for this split by year
+def _obs_split_mask(obs_year: np.ndarray, split: str, split_years: Tuple[int, int, int]) -> np.ndarray:
     tr_end, va_end, _ = split_years
     if split == "train":
-        mask_time = obs_df["YEAR"] <= tr_end
-    elif split == "val":
-        mask_time = (obs_df["YEAR"] > tr_end) & (obs_df["YEAR"] <= va_end)
-    elif split == "test":
-        mask_time = obs_df["YEAR"] > va_end
-    elif split == "all":
-        mask_time = np.ones(len(obs_df), dtype=bool)
+        return obs_year <= tr_end
+    if split == "val":
+        return (obs_year > tr_end) & (obs_year <= va_end)
+    if split == "test":
+        return obs_year > va_end
+    if split == "valtest":
+        return obs_year > tr_end
+    if split == "all":
+        return np.ones_like(obs_year, dtype=bool)
+    raise ValueError("split must be one of train|val|test|valtest|all")
+
+
+def build_time_index_map(
+    lake: LakeData,
+    split: str,
+    split_years: Tuple[int, int, int],
+    *,
+    doy_round: str,
+) -> Dict[Tuple[int, int], int]:
+    t_idx = split_time_indices(lake.year, split, split_years)
+    year_split = lake.year[t_idx].astype(np.int32, copy=False)
+    doy_split = lake.doy[t_idx].astype(np.float32, copy=False)
+
+    if doy_round == "floor":
+        doy_key = np.floor(doy_split).astype(np.int32)
+    elif doy_round == "ceil":
+        doy_key = np.ceil(doy_split).astype(np.int32)
+    elif doy_round == "round":
+        doy_key = np.round(doy_split).astype(np.int32)
     else:
-        raise ValueError("split must be train|val|test|all")
+        raise ValueError("doy_round must be one of floor|round|ceil")
 
-    obs_sel = obs_df[mask_time]
-    if obs_sel.empty:
-        return float("nan"), 0
+    mapping: Dict[Tuple[int, int], int] = {}
+    for local_i, (y, d) in enumerate(zip(year_split.tolist(), doy_key.tolist())):
+        mapping.setdefault((int(y), int(d)), int(local_i))
+    return mapping
 
-    # IMPORTANT FIX:
-    # Build mapping from (YEAR, DOY) -> *split-local* index into sim_truth/sim_pred
-    full_t_idx = split_time_indices(lake.year, split, split_years)  # indices into full lake time
-    year_split = lake.year[full_t_idx]
-    doy_split = lake.doy[full_t_idx]
 
-    mapping = {}
-    for local_i, (y, d) in enumerate(zip(year_split.tolist(), doy_split.tolist())):
-        mapping.setdefault((int(y), int(d)), local_i)
+def align_observations(
+    obs: Observations,
+    lake: LakeData,
+    split: str,
+    split_years: Tuple[int, int, int],
+    *,
+    doy_round: str,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, int]]:
+    """
+    Returns aligned arrays (all split-local):
+      t_local: (M_aligned,) indices into split-local timeseries
+      depth:   (M_aligned,)
+      temp:    (M_aligned,)
+    """
+    mapping = build_time_index_map(lake, split, split_years, doy_round=doy_round)
 
-    Dz_lake = sim_truth.shape[1]
+    mask_split = _obs_split_mask(obs.year, split, split_years)
+    years = obs.year[mask_split]
+    doy_keys = obs.doy_key[mask_split]
+    depths = obs.depth[mask_split]
+    temps = obs.temp[mask_split]
 
-    errors = []
-    n_used = 0
-    for _, row in obs_sel.iterrows():
-        y = int(row["YEAR"])
-        d = int(row["DOY"])
-        z = float(row["depth"])
+    t_local: List[int] = []
+    depth_aligned: List[float] = []
+    temp_aligned: List[float] = []
+    n_missing_time = 0
 
-        key = (y, d)
+    for y, d, z, temp in zip(years.tolist(), doy_keys.tolist(), depths.tolist(), temps.tolist()):
+        key = (int(y), int(d))
         if key not in mapping:
-            continue  # no matching day in this split window
+            n_missing_time += 1
+            continue
+        t_local.append(mapping[key])
+        depth_aligned.append(float(z))
+        temp_aligned.append(float(temp))
 
-        t_idx = mapping[key]  # split-local index (guaranteed 0..T_split-1)
-        prof_truth = sim_truth[t_idx, :Dz_lake]
+    stats = {
+        "n_obs_total": int(obs.year.shape[0]),
+        "n_obs_split": int(years.shape[0]),
+        "n_obs_aligned": int(len(t_local)),
+        "n_obs_missing_time": int(n_missing_time),
+    }
 
-        # interpolate/clamp to obs depth
-        try:
-            val_truth = interp_profile_clamped(prof_truth, depth_grid, z)
-        except Exception:
-            zi = int(min(max(round(z), 0), Dz_lake - 1))
-            val_truth = float(prof_truth[zi])
+    return (
+        np.asarray(t_local, dtype=np.int32),
+        np.asarray(depth_aligned, dtype=np.float32),
+        np.asarray(temp_aligned, dtype=np.float32),
+        stats,
+    )
 
-        # emulator prediction at that day
-        prof_pred = sim_pred[t_idx, :Dz_lake]
-        if np.all(np.isnan(prof_pred)):
+
+# =========================================================
+# RMSE at observation points
+# =========================================================
+
+def interp_profile_clamped(profile: np.ndarray, depth_grid: np.ndarray, z: float) -> float:
+    return float(np.interp(float(z), depth_grid, profile))
+
+
+def year_doy_to_datetime(year: int, doy: float) -> dt.datetime:
+    d = int(doy)
+    d = max(1, min(d, 366))
+    return dt.datetime(int(year), 1, 1) + dt.timedelta(days=d - 1)
+
+
+def residuals_at_obs_points(
+    y_ts: np.ndarray,           # (T_split, Dz)
+    *,
+    t_local: np.ndarray,        # (M,)
+    obs_depth: np.ndarray,      # (M,)
+    obs_temp: np.ndarray,       # (M,)
+    depth_grid: np.ndarray,     # (Dz,)
+    skip_if_all_nan: bool,
+) -> np.ndarray:
+    """
+    Returns residuals (pred - obs) for each aligned observation point.
+    Residual is NaN if the prediction is unavailable at that point.
+    """
+    res = np.full((t_local.shape[0],), np.nan, dtype=np.float32)
+
+    for i, (ti, z, ot) in enumerate(zip(t_local.tolist(), obs_depth.tolist(), obs_temp.tolist())):
+        prof = y_ts[int(ti)]
+        if skip_if_all_nan and bool(np.all(np.isnan(prof))):
             continue
 
-        # fill NaNs across depth if needed
-        if np.isnan(prof_pred).any():
-            valid_idx = np.where(~np.isnan(prof_pred))[0]
+        if np.isnan(prof).any():
+            valid_idx = np.where(~np.isnan(prof))[0]
             if valid_idx.size == 0:
                 continue
-            xp = valid_idx
-            fp = prof_pred[valid_idx]
-            xi = np.arange(len(prof_pred))
-            prof_pred = np.interp(xi, xp, fp).astype(np.float32)
+            prof = np.interp(np.arange(prof.shape[0]), valid_idx, prof[valid_idx]).astype(np.float32)
 
-        try:
-            val_pred = interp_profile_clamped(prof_pred, depth_grid, z)
-        except Exception:
-            zi = int(min(max(round(z), 0), Dz_lake - 1))
-            val_pred = float(prof_pred[zi])
+        pred_at_z = interp_profile_clamped(prof, depth_grid, float(z))
+        res[i] = float(pred_at_z - float(ot))
 
-        # RMSE between emulator and simulator truth at obs-aligned points
-        err = float(val_pred - val_truth)
-        errors.append(err)
-        n_used += 1
+    return res
 
-    if n_used == 0:
+
+def rmse_timeseries_against_obs(
+    y_ts: np.ndarray,           # (T_split, Dz)
+    *,
+    t_local: np.ndarray,        # (M,)
+    obs_depth: np.ndarray,      # (M,)
+    obs_temp: np.ndarray,       # (M,)
+    depth_grid: np.ndarray,     # (Dz,)
+    skip_if_all_nan: bool,
+) -> Tuple[float, int]:
+    errors: List[float] = []
+
+    for ti, z, ot in zip(t_local.tolist(), obs_depth.tolist(), obs_temp.tolist()):
+        prof = y_ts[int(ti)]
+        if skip_if_all_nan and bool(np.all(np.isnan(prof))):
+            continue
+
+        # fill NaNs across depth if present (common for padded/masked depths)
+        if np.isnan(prof).any():
+            valid_idx = np.where(~np.isnan(prof))[0]
+            if valid_idx.size == 0:
+                continue
+            prof = np.interp(np.arange(prof.shape[0]), valid_idx, prof[valid_idx]).astype(np.float32)
+
+        pred_at_z = interp_profile_clamped(prof, depth_grid, float(z))
+        errors.append(float(pred_at_z - float(ot)))
+
+    if not errors:
         return float("nan"), 0
-    errors = np.array(errors, dtype=np.float32)
-    rmse = float(np.sqrt(np.mean(errors ** 2)))
-    return rmse, n_used
+    err = np.asarray(errors, dtype=np.float32)
+    return float(np.sqrt(np.mean(err ** 2))), int(err.shape[0])
 
 
-# ------------------------
-# Main routine
-# ------------------------
-def main():
+# =========================================================
+# Main
+# =========================================================
+
+def _parse_int_csv(s: str) -> List[int]:
+    s = (s or "").strip()
+    if not s:
+        return []
+    out: List[int] = []
+    for part in s.split(","):
+        part = part.strip()
+        if part:
+            out.append(int(part))
+    return out
+
+
+def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", required=True, help="Path to best.pt or MLflow run_id")
-    ap.add_argument("--root_dir", default="data/parsed_data", help="Root with lake subdirs")
-    ap.add_argument("--lakes", nargs="+", required=True, help="List of lake names (subdirs in root_dir)")
-    ap.add_argument("--obs_dir", default="data/original_data", help="Directory with observation CSVs named <lake>.csv or <lake>_obs.csv")
-    ap.add_argument("--outdir", default="compare_outputs", help="Where to save plots/CSV")
+    ap.add_argument("--run_id", required=True, help="MLflow run_id (contains checkpoints/best.pt)")
+    ap.add_argument("--root_dir", default="data/parsed_data", help="Root directory containing lake subdirs")
+    ap.add_argument("--lake", required=True, help="Lake name subdir (e.g. BearLake)")
+    ap.add_argument(
+        "--all_lakes",
+        nargs="+",
+        default=None,
+        help="Optional: list of lakes to load for global norms (should match training lakes).",
+    )
+
     ap.add_argument("--split_years", type=int, nargs=3, default=[2018, 2021, 2025])
-    ap.add_argument("--split", default="test", choices=["train", "val", "test", "all"], help="Which split to compare on")
-    ap.add_argument("--Wx", type=int, default=360)
-    ap.add_argument("--Wy", type=int, default=60)
-    ap.add_argument("--stride", type=int, default=1)
-    ap.add_argument("--batch_windows", type=int, default=128)
-    ap.add_argument("--device", default="cpu")
+    ap.add_argument("--split", default="all", choices=["train", "val", "test", "valtest", "all"])
+    ap.add_argument("--doy_round", default="round", choices=["floor", "round", "ceil"])
+
+    ap.add_argument(
+        "--obs_path",
+        default=None,
+        help="Override observation CSV path; default is data/original_data/{lake}/observations/{lake}-temperature-obs.csv",
+    )
+    ap.add_argument("--outdir", default="outputs_compare")
+
+    ap.add_argument("--stride", type=int, default=1, help="Window stride for inference (>=1). Increase for speed.")
+    ap.add_argument("--batch_windows", type=int, default=64, help="How many windows per forward pass")
+    ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+
+    ap.add_argument(
+        "--sim_ids",
+        default="",
+        help="Optional comma list of sim_ids to evaluate (default: sample up to --max_sims).",
+    )
+    ap.add_argument("--max_sims", type=int, default=200, help="Max sims to evaluate if --sim_ids is empty")
+    ap.add_argument("--seed", type=int, default=123)
+    ap.add_argument("--no_simulator", action="store_true", help="Skip simulator-vs-obs RMSE")
+    ap.add_argument("--no_emulator", action="store_true", help="Skip emulator-vs-obs RMSE")
+
+    ap.add_argument("--plot_misfit_maps", action="store_true", help="Save (t,z) misfit maps for simulator and emulator")
+    ap.add_argument("--misfit_mode", default="abs", choices=["abs", "signed"], help="Color by mean |residual| or mean residual")
+    ap.add_argument("--misfit_s", type=float, default=8.0, help="Marker size for misfit scatter plots")
+
+    ap.add_argument("--plot_spaghetti", action="store_true", help="Save spaghetti plots at common observation depths")
+    ap.add_argument("--spaghetti_depths", type=int, default=3, help="How many depths (by obs frequency) to plot")
+    ap.add_argument("--depth_tol", type=float, default=0.15, help="Tolerance (m) for matching obs to a spaghetti depth")
+    ap.add_argument("--spaghetti_max_sims", type=int, default=30, help="Max sims (lines) in spaghetti plots")
+    ap.add_argument("--spaghetti_alpha", type=float, default=0.08, help="Alpha for spaghetti lines")
+    ap.add_argument("--spaghetti_lw", type=float, default=0.8, help="Linewidth for spaghetti lines")
+
+    ap.add_argument(
+        "--plot_binned_obs_emul_spaghetti",
+        action="store_true",
+        help="Plot observations as depth-bin scatters and emulator spaghetti at bin midpoints over the observation period",
+    )
+    ap.add_argument("--bin_size_m", type=float, default=1.0, help="Depth bin size (meters) for binned obs plot")
+    ap.add_argument("--max_bins", type=int, default=12, help="Max number of depth bins/subplots to draw")
+
     args = ap.parse_args()
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
 
     os.makedirs(args.outdir, exist_ok=True)
 
-    # 1) load checkpoint (config + state_dict + maybe norms)
-    _, ckpt = load_checkpoint(args.ckpt)
+    # ----- load checkpoint
+    _, ckpt = load_checkpoint_from_mlflow(args.run_id)
     cfg = ckpt.get("config", {})
-    # prefer Wx/Wy from checkpoint config if available
-    Wx = int(cfg.get("Wx", args.Wx))
-    Wy = int(cfg.get("Wy", args.Wy))
+    Wx = int(cfg.get("Wx", 365))
+    Wy = int(cfg.get("Wy", 30))
 
-    # 2) load multi-lake data and global norms (normalize=True so loader returns norms)
-    lakes, norms_dataset = load_multi_lake_data(
+    # ----- load data (optionally multiple lakes for norms consistency)
+    lakes_to_load = args.all_lakes if args.all_lakes is not None else [args.lake]
+    lakes, norms = load_multi_lake_data(
         root_dir=args.root_dir,
-        lake_names=list(args.lakes),
+        lake_names=list(lakes_to_load),
         split_years=list(args.split_years),
         normalize=True,
     )
 
-    # choose norms: prefer ckpt["norms"] if present (convenience), else use dataset norms
-    norms_ckpt = ckpt.get("norms", None)
-    norms = norms_ckpt if norms_ckpt is not None else norms_dataset
+    lake: Optional[LakeData] = None
+    for lk in lakes:
+        if lk.name == args.lake:
+            lake = lk
+            break
+    if lake is None:
+        raise ValueError(f"Requested lake='{args.lake}' not found in loaded lakes={lakes_to_load}")
 
-    # 3) rebuild model from ckpt config (we expect ModelRNNDepth)
-    Du = lakes[0].drivers.shape[1]
-    P = lakes[0].params.shape[1]
-    Dd = lakes[0].depth_feat.shape[1]
+    # ----- infer dims & build model
+    Du = lake.drivers.shape[1]
+    P = lake.params.shape[1]
+    Dd = lake.depth_feat.shape[1]
+    Dz_lake = lake.Dz
+    Dzmax = max(lk.Dz for lk in lakes)
+
     model = build_model_from_ckpt_config(cfg, Du=Du, P=P, Dd=Dd)
     model.load_state_dict(ckpt["state_dict"])
     model.to(args.device)
     model.eval()
 
-    results_per_lake = {}
+    depth_feat_padded = np.zeros((Dzmax, Dd), dtype=np.float32)
+    depth_feat_padded[:Dz_lake, :] = lake.depth_feat.astype(np.float32, copy=False)
 
-    for lk in lakes:
-        print(f"[INFO] Processing lake {lk.name} (Dz={lk.Dz})")
+    # ----- load observations
+    obs_path = args.obs_path or os.path.join(
+        "data", "original_data", args.lake, "observations", f"{args.lake}-temperature-obs.csv"
+    )
+    if not os.path.isfile(obs_path):
+        raise FileNotFoundError(f"Could not find observations at {obs_path}")
+    obs = load_observations_csv(obs_path)
 
-        # depth grid (use integer indices starting at 0.5 similar to previous convention)
-        depth_grid = (np.arange(lk.Dz, dtype=np.float32) + 0.5).astype(np.float32)
+    # ----- align observations to split-local timeseries indices
+    t_local, obs_depth, obs_temp, obs_stats = align_observations(
+        obs, lake, args.split, tuple(args.split_years), doy_round=args.doy_round
+    )
+    print(f"[obs] {args.lake} {args.split}: {obs_stats}")
+    if t_local.size == 0:
+        raise RuntimeError("No aligned observations found after YEAR/DOY alignment.")
 
-        # padded depth_feat and mask to Dz_max (for model input)
-        Dzmax = max(l.Dz for l in lakes)
-        Dd = lk.depth_feat.shape[1]
-        df_pad = np.zeros((Dzmax, Dd), dtype=np.float32)
-        df_pad[:lk.Dz, :] = lk.depth_feat.astype(np.float32, copy=False)
-        depth_mask = np.zeros((Dzmax,), dtype=np.float32)
-        depth_mask[:lk.Dz] = 1.0
+    # ----- select sims
+    sim_ids = _parse_int_csv(args.sim_ids)
+    if sim_ids:
+        sim_ids = [i for i in sim_ids if 0 <= i < int(lake.params.shape[0])]
+    else:
+        all_ids = list(range(int(lake.params.shape[0])))
+        random.shuffle(all_ids)
+        sim_ids = all_ids[: int(min(args.max_sims, len(all_ids)))]
+    sim_ids = sorted(sim_ids)
 
-        # load observations for this lake
-        cand1 = os.path.join(args.obs_dir, f"{lk.name}/observations/{lk.name}-temperature-obs.csv")
-        if os.path.isfile(cand1):
-            obs_path = cand1
-        else:
-            print(f"[WARN] No observations file found for lake {lk.name} (tried {cand1}). Skipping.")
-            continue
-        obs_df = parse_obs_csv(obs_path)
+    # ----- depth grid convention
+    # We assume bathymetry bins correspond to 1m depth increments; use bin midpoints.
+    depth_grid = (np.arange(Dz_lake, dtype=np.float32) + 0.5).astype(np.float32)
 
-        num_sims = lk.params.shape[0]
-        sim_rmses_sim = np.full((num_sims,), np.nan, dtype=np.float32)
-        sim_rmses_emul = np.full((num_sims,), np.nan, dtype=np.float32)
-        sim_counts = np.zeros((num_sims,), dtype=int)
+    # ----- precompute split indices for simulator slices / emulator drivers
+    t_idx_split = split_time_indices(lake.year, args.split, tuple(args.split_years))
+    drivers_split = lake.drivers[t_idx_split, :]
+    year_split = lake.year[t_idx_split].astype(np.int32, copy=False)
+    doy_split = lake.doy[t_idx_split].astype(np.float32, copy=False)
+    time_split_dt = np.asarray([year_doy_to_datetime(int(y), float(d)) for y, d in zip(year_split, doy_split)])
 
-        for sim_id in range(num_sims):
-            truth_norm, pred_norm, _ = predict_split_for_sim(
-                model=model, lake=lk, sim_id=sim_id,
-                depth_feat_padded=df_pad, depth_mask=depth_mask,
-                split=args.split, split_years=tuple(args.split_years),
-                Wx=Wx, Wy=Wy, stride=args.stride, device=args.device,
-                batch_windows=args.batch_windows
+    # ----- evaluate
+    rows = []
+    residuals_sim_by_sim: List[np.ndarray] = []
+    residuals_emul_by_sim: List[np.ndarray] = []
+    for sim_id in sim_ids:
+        row = {"sim_id": int(sim_id)}
+
+        if not args.no_simulator:
+            y_sim_norm = lake.temps[int(sim_id), t_idx_split, :]  # (T_split, Dz_lake) normalized
+            y_sim = denorm_outputs(y_sim_norm, norms, Dz=Dz_lake) if norms is not None else y_sim_norm
+            residuals_sim_by_sim.append(
+                residuals_at_obs_points(
+                    y_sim,
+                    t_local=t_local,
+                    obs_depth=obs_depth,
+                    obs_temp=obs_temp,
+                    depth_grid=depth_grid,
+                    skip_if_all_nan=False,
+                )
             )
-            pred_norm_slice = pred_norm[:, :lk.Dz]
-
-            # denormalize to physical units if norms exist
-            if norms is not None:
-                truth_den = denorm_outputs(truth_norm, norms, Dz=lk.Dz)  # (T, Dz)
-                pred_den_full = np.full((pred_norm.shape[0], lk.Dz), np.nan, dtype=np.float32)
-                mask_valid_rows = ~np.all(np.isnan(pred_norm_slice), axis=1)
-                if mask_valid_rows.any():
-                    pred_den_full[mask_valid_rows, :] = denorm_outputs(
-                        pred_norm_slice[mask_valid_rows, :], norms, Dz=lk.Dz
-                    )
-                else:
-                    pred_den_full[:] = np.nan
-            else:
-                truth_den = truth_norm
-                pred_den_full = pred_norm_slice
-
-            rmse, n_used = compute_rmse_for_obs(
-                obs_df=obs_df,
-                lake=lk,
-                sim_truth=truth_den,
-                sim_pred=pred_den_full,
+            rmse_sim, n_sim = rmse_timeseries_against_obs(
+                y_sim,
+                t_local=t_local,
+                obs_depth=obs_depth,
+                obs_temp=obs_temp,
                 depth_grid=depth_grid,
-                split=args.split,
-                split_years=tuple(args.split_years),
+                skip_if_all_nan=False,
             )
-            sim_rmses_emul[sim_id] = rmse
-            sim_counts[sim_id] = n_used
+            row.update({"rmse_sim_obs": float(rmse_sim), "n_obs_sim": int(n_sim)})
 
-        # Simulator-vs-obs RMSE (baseline) — computed properly
-        def compute_rmse_obs_vs_simulator_for_sim(sim_index: int) -> Tuple[float, int]:
-            truth_norm_sim, _, _ = predict_split_for_sim(
-                model=model, lake=lk, sim_id=sim_index,
-                depth_feat_padded=df_pad, depth_mask=depth_mask,
-                split=args.split, split_years=tuple(args.split_years),
-                Wx=Wx, Wy=Wy, stride=args.stride, device=args.device,
-                batch_windows=args.batch_windows
+        if not args.no_emulator:
+            if drivers_split.shape[0] < Wx:
+                raise ValueError(f"Split has T={drivers_split.shape[0]} < Wx={Wx}; cannot run emulator windows.")
+            y_pred_norm = predict_timeseries_for_sim_batched(
+                model=model,
+                drivers=drivers_split,
+                p_vec=lake.params[int(sim_id)],
+                depth_feat_padded=depth_feat_padded,
+                Wx=Wx,
+                Wy=Wy,
+                stride=max(1, int(args.stride)),
+                device=args.device,
+                batch_windows=max(1, int(args.batch_windows)),
+            )  # (T_split, Dzmax) normalized
+            y_pred_norm = y_pred_norm[:, :Dz_lake]
+            y_pred = denorm_outputs(y_pred_norm, norms, Dz=Dz_lake) if norms is not None else y_pred_norm
+
+            residuals_emul_by_sim.append(
+                residuals_at_obs_points(
+                    y_pred,
+                    t_local=t_local,
+                    obs_depth=obs_depth,
+                    obs_temp=obs_temp,
+                    depth_grid=depth_grid,
+                    skip_if_all_nan=True,
+                )
             )
-            truth_den_sim = denorm_outputs(truth_norm_sim, norms, Dz=lk.Dz) if norms is not None else truth_norm_sim
+            rmse_emul, n_emul = rmse_timeseries_against_obs(
+                y_pred,
+                t_local=t_local,
+                obs_depth=obs_depth,
+                obs_temp=obs_temp,
+                depth_grid=depth_grid,
+                skip_if_all_nan=True,
+            )
+            row.update({"rmse_emul_obs": float(rmse_emul), "n_obs_emul": int(n_emul)})
 
-            # obs split selection by year
-            tr_end, va_end, _ = tuple(args.split_years)
-            if args.split == "train":
-                obs_sel = obs_df[obs_df["YEAR"] <= tr_end]
-            elif args.split == "val":
-                obs_sel = obs_df[(obs_df["YEAR"] > tr_end) & (obs_df["YEAR"] <= va_end)]
-            elif args.split == "test":
-                obs_sel = obs_df[obs_df["YEAR"] > va_end]
-            else:
-                obs_sel = obs_df
+        rows.append(row)
 
-            if obs_sel.empty:
-                return float("nan"), 0
+    # ----- save CSV
+    csv_path = os.path.join(args.outdir, f"{args.lake}_rmse_per_sim_{args.split}_run_{args.run_id}.csv")
+    fieldnames = sorted({k for r in rows for k in r.keys()})
+    with open(csv_path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        w.writerows(rows)
+    print(f"[saved] {csv_path}")
 
-            # IMPORTANT FIX: split-local mapping
-            full_t_idx = _split_time_indices(lk, args.split, tuple(args.split_years))
-            year_split = lk.year[full_t_idx]
-            doy_split = lk.doy[full_t_idx]
-            mapping = {}
-            for local_i, (y, d) in enumerate(zip(year_split.tolist(), doy_split.tolist())):
-                mapping.setdefault((int(y), int(d)), local_i)
+    # ----- quick plots
+    def _col(name: str) -> np.ndarray:
+        vals = [r.get(name, float("nan")) for r in rows]
+        return np.asarray(vals, dtype=np.float32)
 
-            errors = []
-            n_used_local = 0
-            for _, row in obs_sel.iterrows():
-                key = (int(row["YEAR"]), int(row["DOY"]))
-                if key not in mapping:
-                    continue
-                t_idx = mapping[key]  # split-local
-                z = float(row["depth"])
-                obs_val = float(row["temperature"])
+    rmse_sim = _col("rmse_sim_obs")
+    rmse_emul = _col("rmse_emul_obs")
 
-                prof_sim = truth_den_sim[t_idx, :lk.Dz]
-                sim_at_z = interp_profile_clamped(prof_sim, depth_grid, z)
-                errors.append(sim_at_z - obs_val)
-                n_used_local += 1
-
-            if n_used_local == 0:
-                return float("nan"), 0
-            err_arr = np.array(errors, dtype=np.float32)
-            return float(np.sqrt(np.mean(err_arr ** 2))), n_used_local
-
-        for sim_id in range(num_sims):
-            base_rmse, _ = compute_rmse_obs_vs_simulator_for_sim(sim_id)
-            sim_rmses_sim[sim_id] = base_rmse
-
-        results_per_lake[lk.name] = {
-            "sim_rmse": sim_rmses_sim,
-            "emul_rmse": sim_rmses_emul,
-            "counts": sim_counts,
-        }
-
-        valid_mask = (sim_counts > 0)
-        x = sim_rmses_sim[valid_mask]
-        y = sim_rmses_emul[valid_mask]
-
-        # Histogram
-        plt.figure(figsize=(6, 4))
-        plt.hist(x[~np.isnan(x)], bins=40, alpha=0.7, label="sim")
-        plt.hist(y[~np.isnan(y)], bins=40, alpha=0.7, label="emul")
-        plt.legend()
-        plt.title(f"{lk.name} RMSE distribution (split={args.split})")
+    if not args.no_simulator and np.isfinite(rmse_sim).any():
+        plt.figure(figsize=(7, 4))
+        plt.hist(rmse_sim[np.isfinite(rmse_sim)], bins=40, alpha=0.8, label="sim vs obs")
         plt.xlabel("RMSE (°C)")
         plt.ylabel("count")
-        out_hist = os.path.join(args.outdir, f"{lk.name}_rmse_hist_{args.split}.png")
+        plt.title(f"{args.lake} | {args.split} | run={args.run_id} | simulator")
         plt.tight_layout()
-        plt.savefig(out_hist, dpi=150)
+        p = os.path.join(args.outdir, f"{args.lake}_{args.split}_hist_sim_run_{args.run_id}.png")
+        plt.savefig(p, dpi=160)
         plt.close()
-        print(f"[saved] {out_hist}")
+        print(f"[saved] {p}")
 
-        # Scatter
-        plt.figure(figsize=(6, 6))
-        plt.scatter(x, y, alpha=0.6)
-        maxval = np.nanmax(np.concatenate([x[~np.isnan(x)], y[~np.isnan(y)], np.array([0.1])]))
-        plt.plot([0, maxval], [0, maxval], linestyle="--", color="k")
-        plt.xlabel("Simulator RMSE (°C)")
-        plt.ylabel("Emulator RMSE (°C)")
-        plt.title(f"{lk.name} per-sim RMSE (split={args.split})")
-        out_scatter = os.path.join(args.outdir, f"{lk.name}_rmse_scatter_{args.split}.png")
+    if not args.no_emulator and np.isfinite(rmse_emul).any():
+        plt.figure(figsize=(7, 4))
+        plt.hist(rmse_emul[np.isfinite(rmse_emul)], bins=40, alpha=0.8, label="emulator vs obs")
+        plt.xlabel("RMSE (°C)")
+        plt.ylabel("count")
+        plt.title(f"{args.lake} | {args.split} | run={args.run_id} | emulator")
         plt.tight_layout()
-        plt.savefig(out_scatter, dpi=150)
+        p = os.path.join(args.outdir, f"{args.lake}_{args.split}_hist_emul_run_{args.run_id}.png")
+        plt.savefig(p, dpi=160)
         plt.close()
-        print(f"[saved] {out_scatter}")
+        print(f"[saved] {p}")
 
-        # CSV
-        df_out = pd.DataFrame({
-            "sim_id": np.arange(num_sims),
-            "sim_rmse": sim_rmses_sim,
-            "emul_rmse": sim_rmses_emul,
-            "n_obs_used": sim_counts,
-        })
-        csv_out = os.path.join(args.outdir, f"{lk.name}_rmse_per_sim_{args.split}.csv")
-        df_out.to_csv(csv_out, index=False)
-        print(f"[saved] {csv_out}")
+    if (not args.no_simulator) and (not args.no_emulator):
+        mask = np.isfinite(rmse_sim) & np.isfinite(rmse_emul)
+        if mask.any():
+            plt.figure(figsize=(6, 6))
+            plt.scatter(rmse_sim[mask], rmse_emul[mask], alpha=0.65)
+            mx = float(np.nanmax(np.concatenate([rmse_sim[mask], rmse_emul[mask], np.asarray([0.1], np.float32)])))
+            plt.plot([0.0, mx], [0.0, mx], "k--", linewidth=1.0)
+            plt.xlabel("Simulator RMSE vs obs (°C)")
+            plt.ylabel("Emulator RMSE vs obs (°C)")
+            plt.title(f"{args.lake} | {args.split} | run={args.run_id}")
+            plt.tight_layout()
+            p = os.path.join(args.outdir, f"{args.lake}_{args.split}_scatter_sim_vs_emul_run_{args.run_id}.png")
+            plt.savefig(p, dpi=160)
+            plt.close()
+            print(f"[saved] {p}")
 
-    print("All done.")
+    # ----- misfit maps: average misfit at each observation point across sims
+    if args.plot_misfit_maps:
+        t_obs_dt = np.asarray([time_split_dt[int(ti)] for ti in t_local.tolist()])
+        z_obs = obs_depth.astype(np.float32, copy=False)
+
+        fig, axes = plt.subplots(1, 2, figsize=(13.5, 5.3), sharey=True, constrained_layout=True)
+        panels: List[Tuple[str, List[np.ndarray], bool]] = [
+            ("Simulator", residuals_sim_by_sim, not args.no_simulator),
+            ("Emulator", residuals_emul_by_sim, not args.no_emulator),
+        ]
+
+        for ax, (title, res_list, enabled) in zip(axes, panels):
+            if (not enabled) or (not res_list):
+                ax.set_title(f"{title} (skipped)")
+                ax.set_xlabel("Time")
+                ax.grid(True, alpha=0.2)
+                continue
+
+            res_stack = np.stack(res_list, axis=0)  # (S, M)
+            if args.misfit_mode == "abs":
+                vals = np.nanmean(np.abs(res_stack), axis=0)
+                cmap = "viridis"
+                vmin, vmax = None, None
+                clabel = "Mean |pred - obs| (°C)"
+            else:
+                vals = np.nanmean(res_stack, axis=0)
+                cmap = "coolwarm"
+                vmax = float(np.nanmax(np.abs(vals))) if np.isfinite(vals).any() else 1.0
+                vmin = -vmax
+                clabel = "Mean (pred - obs) (°C)"
+
+            m = np.isfinite(vals)
+            sc = ax.scatter(
+                t_obs_dt[m],
+                z_obs[m],
+                c=vals[m],
+                s=float(args.misfit_s),
+                cmap=cmap,
+                vmin=vmin,
+                vmax=vmax,
+                alpha=0.9,
+                linewidths=0.0,
+            )
+            ax.set_title(title)
+            ax.set_xlabel("Time")
+            ax.grid(True, alpha=0.2)
+            ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+            ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(ax.xaxis.get_major_locator()))
+            cb = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.02)
+            cb.set_label(clabel)
+
+        axes[0].set_ylabel("Depth (m)")
+        axes[0].invert_yaxis()
+        fname = os.path.join(
+            args.outdir,
+            f"{args.lake}_{args.split}_misfit_maps_{args.misfit_mode}_run_{args.run_id}.png",
+        )
+        plt.savefig(fname, dpi=180)
+        plt.close(fig)
+        print(f"[saved] {fname}")
+
+    # ----- spaghetti plots: common observation depths with obs overlay
+    if args.plot_spaghetti:
+        # choose depths by frequency among aligned obs points
+        depth_vals, depth_counts = np.unique(obs_depth.astype(np.float32), return_counts=True)
+        order = np.argsort(-depth_counts)
+        top_depths = depth_vals[order][: int(max(1, args.spaghetti_depths))].tolist()
+
+        # keep plot readable: subsample sims for spaghetti
+        spaghetti_sim_ids = sim_ids[: int(min(len(sim_ids), args.spaghetti_max_sims))]
+
+        def plot_spaghetti_panel(
+            *,
+            title: str,
+            y_by_sim: Dict[int, np.ndarray],  # sim_id -> (T_split, Dz_lake)
+            outpath: str,
+        ) -> None:
+            fig, axes = plt.subplots(len(top_depths), 1, figsize=(13.5, 3.3 * len(top_depths)), sharex=True)
+            if len(top_depths) == 1:
+                axes = [axes]
+
+            for ax, z0 in zip(axes, top_depths):
+                # spaghetti lines
+                for sid, y_ts in y_by_sim.items():
+                    # interpolate time series at z0
+                    series = np.full((y_ts.shape[0],), np.nan, dtype=np.float32)
+                    for ti in range(y_ts.shape[0]):
+                        prof = y_ts[ti]
+                        if np.all(np.isnan(prof)):
+                            continue
+                        if np.isnan(prof).any():
+                            valid_idx = np.where(~np.isnan(prof))[0]
+                            if valid_idx.size == 0:
+                                continue
+                            prof = np.interp(np.arange(prof.shape[0]), valid_idx, prof[valid_idx]).astype(np.float32)
+                        series[ti] = interp_profile_clamped(prof, depth_grid, float(z0))
+                    ax.plot(
+                        time_split_dt,
+                        series,
+                        linewidth=float(args.spaghetti_lw),
+                        alpha=float(args.spaghetti_alpha),
+                        color="tab:blue",
+                    )
+
+                # overlay observations near this depth
+                m = np.abs(obs_depth - float(z0)) <= float(args.depth_tol)
+                if bool(np.any(m)):
+                    t_obs_dt = np.asarray([time_split_dt[int(ti)] for ti in t_local[m].tolist()])
+                    ax.scatter(t_obs_dt, obs_temp[m], s=14.0, color="black", alpha=0.8, label="obs")
+
+                ax.set_ylabel(f"T (°C)\nz≈{float(z0):g}m")
+                ax.grid(True, alpha=0.2)
+                ax.legend(loc="best")
+
+            axes[-1].set_xlabel("Time")
+            axes[-1].xaxis.set_major_locator(mdates.AutoDateLocator())
+            axes[-1].xaxis.set_major_formatter(mdates.ConciseDateFormatter(axes[-1].xaxis.get_major_locator()))
+            fig.suptitle(title, y=0.995)
+            plt.tight_layout(rect=[0, 0.02, 1, 0.98])
+            plt.savefig(outpath, dpi=180)
+            plt.close(fig)
+            print(f"[saved] {outpath}")
+
+        if not args.no_simulator:
+            y_sim_by_sim: Dict[int, np.ndarray] = {}
+            for sid in spaghetti_sim_ids:
+                y_sim_norm = lake.temps[int(sid), t_idx_split, :]
+                y_sim = denorm_outputs(y_sim_norm, norms, Dz=Dz_lake) if norms is not None else y_sim_norm
+                y_sim_by_sim[int(sid)] = y_sim
+            outpath = os.path.join(args.outdir, f"{args.lake}_{args.split}_spaghetti_sim_run_{args.run_id}.png")
+            plot_spaghetti_panel(
+                title=f"{args.lake} | {args.split} | run={args.run_id} | simulator spaghetti (n={len(spaghetti_sim_ids)})",
+                y_by_sim=y_sim_by_sim,
+                outpath=outpath,
+            )
+
+        if not args.no_emulator:
+            y_emul_by_sim: Dict[int, np.ndarray] = {}
+            if drivers_split.shape[0] < Wx:
+                print(f"[WARN] Skipping emulator spaghetti: split has T={drivers_split.shape[0]} < Wx={Wx}")
+            else:
+                for sid in spaghetti_sim_ids:
+                    y_pred_norm = predict_timeseries_for_sim_batched(
+                        model=model,
+                        drivers=drivers_split,
+                        p_vec=lake.params[int(sid)],
+                        depth_feat_padded=depth_feat_padded,
+                        Wx=Wx,
+                        Wy=Wy,
+                        stride=max(1, int(args.stride)),
+                        device=args.device,
+                        batch_windows=max(1, int(args.batch_windows)),
+                    )
+                    y_pred_norm = y_pred_norm[:, :Dz_lake]
+                    y_pred = denorm_outputs(y_pred_norm, norms, Dz=Dz_lake) if norms is not None else y_pred_norm
+                    y_emul_by_sim[int(sid)] = y_pred
+                outpath = os.path.join(args.outdir, f"{args.lake}_{args.split}_spaghetti_emul_run_{args.run_id}.png")
+                plot_spaghetti_panel(
+                    title=f"{args.lake} | {args.split} | run={args.run_id} | emulator spaghetti (n={len(spaghetti_sim_ids)})",
+                    y_by_sim=y_emul_by_sim,
+                    outpath=outpath,
+                )
+
+    # ----- binned observation scatter + emulator spaghetti at bin midpoints
+    if args.plot_binned_obs_emul_spaghetti:
+        if args.no_emulator:
+            raise ValueError("--plot_binned_obs_emul_spaghetti requires emulator evaluation (remove --no_emulator)")
+        if drivers_split.shape[0] < Wx:
+            raise ValueError(f"Split has T={drivers_split.shape[0]} < Wx={Wx}; cannot run emulator windows.")
+
+        # restrict plots to the observation period (in split-local indices)
+        t_min = int(np.min(t_local))
+        t_max = int(np.max(t_local))
+        t_slice = slice(t_min, t_max + 1)
+        time_obs_dt = time_split_dt[t_slice]
+
+        # bins from aligned observations (only bins with at least 1 obs)
+        if float(args.bin_size_m) <= 0.0:
+            raise ValueError("--bin_size_m must be > 0")
+
+        z_min = float(np.nanmin(obs_depth))
+        z_max = float(np.nanmax(obs_depth))
+        if not np.isfinite(z_min) or not np.isfinite(z_max):
+            raise ValueError("Observation depths are not finite.")
+
+        bin_size = float(args.bin_size_m)
+        start = max(0.0, float(np.floor(z_min / bin_size) * bin_size))
+        end = float(np.ceil(z_max / bin_size) * bin_size)
+
+        edges = np.arange(start, end + 1e-6, bin_size, dtype=np.float32)
+        bins: List[Tuple[float, float]] = []
+        for z0, z1 in zip(edges[:-1].tolist(), edges[1:].tolist()):
+            m = (obs_depth >= float(z0)) & (obs_depth < float(z1))
+            if bool(np.any(m)):
+                bins.append((float(z0), float(z1)))
+
+        # cap number of bins by observation count (most populated first)
+        if len(bins) > int(args.max_bins):
+            counts = []
+            for z0, z1 in bins:
+                counts.append(int(np.sum((obs_depth >= z0) & (obs_depth < z1))))
+            order = np.argsort(-np.asarray(counts, dtype=np.int32))
+            bins = [bins[int(i)] for i in order[: int(args.max_bins)]]
+
+        if not bins:
+            raise RuntimeError("No non-empty depth bins found in aligned observations.")
+
+        # choose sims: use up to spaghetti_max_sims, but allow user to set it to all sims (e.g. 1000)
+        spaghetti_sim_ids = sim_ids[: int(min(len(sim_ids), args.spaghetti_max_sims))]
+
+        # for each sim, compute temperature time series at each bin midpoint
+        midpoints = np.asarray([(z0 + z1) / 2.0 for z0, z1 in bins], dtype=np.float32)
+        series_by_sim: Dict[int, np.ndarray] = {}  # sim_id -> (T_obs_period, B)
+
+        for sid in spaghetti_sim_ids:
+            y_pred_norm = predict_timeseries_for_sim_batched(
+                model=model,
+                drivers=drivers_split,
+                p_vec=lake.params[int(sid)],
+                depth_feat_padded=depth_feat_padded,
+                Wx=Wx,
+                Wy=Wy,
+                stride=max(1, int(args.stride)),
+                device=args.device,
+                batch_windows=max(1, int(args.batch_windows)),
+            )
+            y_pred_norm = y_pred_norm[:, :Dz_lake]
+            y_pred = denorm_outputs(y_pred_norm, norms, Dz=Dz_lake) if norms is not None else y_pred_norm
+            y_pred = y_pred[t_slice, :]  # (T_obs_period, Dz_lake)
+
+            out = np.full((y_pred.shape[0], midpoints.shape[0]), np.nan, dtype=np.float32)
+            for ti in range(y_pred.shape[0]):
+                prof = y_pred[ti]
+                if np.all(np.isnan(prof)):
+                    continue
+                if np.isnan(prof).any():
+                    valid_idx = np.where(~np.isnan(prof))[0]
+                    if valid_idx.size == 0:
+                        continue
+                    prof = np.interp(np.arange(prof.shape[0]), valid_idx, prof[valid_idx]).astype(np.float32)
+                for bi, zmid in enumerate(midpoints.tolist()):
+                    out[ti, bi] = interp_profile_clamped(prof, depth_grid, float(zmid))
+            series_by_sim[int(sid)] = out
+
+        # plot: one subplot per bin, obs scatter + emulator spaghetti
+        fig, axes = plt.subplots(len(bins), 1, figsize=(13.5, 3.2 * len(bins)), sharex=True)
+        if len(bins) == 1:
+            axes = [axes]
+
+        for ax, (z0, z1), bi in zip(axes, bins, range(len(bins))):
+            zmid = float(midpoints[bi])
+
+            # obs points in this bin, restricted to observation period indices
+            m_bin = (obs_depth >= float(z0)) & (obs_depth < float(z1))
+            t_bin = t_local[m_bin]
+            temp_bin = obs_temp[m_bin]
+            t_bin_dt = np.asarray([time_split_dt[int(ti)] for ti in t_bin.tolist()])
+
+            ax.scatter(t_bin_dt, temp_bin, s=16.0, color="black", alpha=0.8, label="obs")
+
+            for sid, mat in series_by_sim.items():
+                ax.plot(
+                    time_obs_dt,
+                    mat[:, bi],
+                    linewidth=float(args.spaghetti_lw),
+                    alpha=float(args.spaghetti_alpha),
+                    color="tab:blue",
+                )
+
+            ax.set_ylabel(f"T (°C)\n{z0:g}-{z1:g}m (mid {zmid:g})")
+            ax.grid(True, alpha=0.2)
+            ax.legend(loc="best")
+
+        axes[-1].set_xlabel("Time")
+        axes[-1].xaxis.set_major_locator(mdates.AutoDateLocator())
+        axes[-1].xaxis.set_major_formatter(mdates.ConciseDateFormatter(axes[-1].xaxis.get_major_locator()))
+        fig.suptitle(
+            f"{args.lake} | {args.split} | run={args.run_id} | emulator spaghetti over obs period (n={len(spaghetti_sim_ids)})",
+            y=0.995,
+        )
+        plt.tight_layout(rect=[0, 0.02, 1, 0.98])
+        outpath = os.path.join(
+            args.outdir,
+            f"{args.lake}_{args.split}_binned_obs_emul_spaghetti_bin_{args.bin_size_m:g}m_run_{args.run_id}.png",
+        )
+        plt.savefig(outpath, dpi=180)
+        plt.close(fig)
+        print(f"[saved] {outpath}")
 
 
 if __name__ == "__main__":
