@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# train.py
+# train1.py
 from __future__ import annotations
 
 import os
@@ -287,17 +287,17 @@ def main():
     ap.add_argument("--hidden", type=int, default=32)
     ap.add_argument("--num_layers", type=int, default=2)
     ap.add_argument("--rnn_dropout", type=float, default=0.0)
-    ap.add_argument("--head_hidden", type=str, default="256,256,256")
+    ap.add_argument("--head_hidden", type=str, default="128,128,128")
     ap.add_argument("--head_dropout", type=float, default=0.0)
     ap.add_argument("--param_in_rnn", type=int, default=1)
     ap.add_argument("--param_in_head", type=int, default=1)
 
     # training
-    ap.add_argument("--epochs", type=int, default=20)
+    ap.add_argument("--epochs", type=int, default=5)
     ap.add_argument("--batch_size", type=int, default=512)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--smooth_lambda", type=float, default=0.0)
-    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--seed", type=int, default=100)
 
     # infra
     ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -307,8 +307,14 @@ def main():
 
     # logging / artifacts
     ap.add_argument("--artifacts", type=str, default="artifacts_run")
-    ap.add_argument("--experiment", type=str, default="test")
+    ap.add_argument("--experiment", type=str, default="Single Lake Training")
     ap.add_argument("--log_debug_plot", type=int, default=1)
+    ap.add_argument(
+        "--run_name",
+        type=str,
+        default="MultiLake_GRU_Wx{Wx}_Wy{Wy}",
+        help="MLflow run name (supports Python format fields from args, e.g. '{Wx}', '{Wy}', '{seed}')",
+    )
 
     args = ap.parse_args()
 
@@ -337,22 +343,37 @@ def main():
     lakes_all = load_lakes_by_name(args.root_dir, union_names)
     lakes_by_name = index_lakes(lakes_all)
 
+    missing_norm = [nm for nm in norm_lakes if nm not in lakes_by_name]
+    missing_train = [nm for nm in train_lakes if nm not in lakes_by_name]
+    missing_test = [nm for nm in test_lakes if nm not in lakes_by_name]
+    if missing_norm or missing_train or missing_test:
+        raise ValueError(
+            "Unknown lakes specified. "
+            f"missing_norm={missing_norm}, missing_train={missing_train}, missing_test={missing_test}"
+        )
+
     # Compute universal norms (train years only) from norm_lakes, then apply to all.
     norms = None
     if bool(args.normalize):
-        missing_norm = [nm for nm in norm_lakes if nm not in lakes_by_name]
-        if missing_norm:
-            raise ValueError(f"norm_lakes contains unknown lakes: {missing_norm}")
-
         norms_src = [lakes_by_name[nm] for nm in norm_lakes]
         norms = compute_global_norms(norms_src, split_years=split_years)
+
+        # Guard: norms are depth-padded only to Dz_max over norm_lakes. If any lake to be normalized is deeper,
+        # normalization will fail or be ill-defined. Force an explicit error with guidance.
+        dz_max_norm = int(np.asarray(norms.get("Dz_max", [0])).reshape(-1)[0])
+        dz_max_union = max(int(lk.Dz) for lk in lakes_all)
+        if dz_max_norm < dz_max_union:
+            raise ValueError(
+                f"norm_lakes Dz_max={dz_max_norm} is smaller than union Dz_max={dz_max_union}. "
+                "Include the deepest lake(s) in --norm_lakes (or set --norm_lakes to the union) so output norms "
+                "cover all depths that will be normalized."
+            )
 
         for lk in lakes_all:
             apply_norms_inplace(lk, norms)
 
     # Prepare lists for datasets
     train_list = [lakes_by_name[nm] for nm in train_lakes]
-    test_list = [lakes_by_name[nm] for nm in test_lakes]
 
     # Build datasets (train/val ONLY from train_lakes)
     train_ds = MultiLakeWindowDataset(
@@ -412,7 +433,13 @@ def main():
 
     # MLflow
     mlflow.set_experiment(args.experiment)
-    run_name = f"MultiLake_GRU_Wx{args.Wx}_Wy{args.Wy}"
+    try:
+        run_name = str(args.run_name).format(**vars(args))
+    except KeyError as e:
+        raise ValueError(
+            f"--run_name references unknown field {str(e)!r}. "
+            "Use only fields that exist in the parsed args, e.g. '{Wx}', '{Wy}', '{seed}'."
+        ) from e
     best_val = float("inf")
     best_path = os.path.join(args.artifacts, "best.pt")
 
